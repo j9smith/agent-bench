@@ -81,6 +81,7 @@ llm = LLM(
         "X-Task-Id": task_id,
         "X-Session-Id": task_id,
         "X-Session-Type": "agentic",
+        "X-Run-Id": cfg["run_id"],
     },
 )
 
@@ -147,26 +148,38 @@ def swebench_instances(subset: str, split: str, n: int, shuffle: bool) -> list[d
 
 
 def prepare_workspace(inst: dict, root: Path) -> Path:
-    """Shallow (depth-1) checkout of the base commit, so N concurrent tasks
-    don't fill the disk with git history. ~150MB vs ~2.9GB per repo."""
+    """Check out the repo at the task's base commit. Cheap, and avoids depending on
+    the SWE-bench Docker images being buildable, which is the flakiest part of the
+    whole stack. Tests still run -- they just run in this checkout.
+
+    Disk: a full clone of e.g. django is ~2.9GB of history for a single commit we
+    actually want. At concurrency 24 that fills the volume. So we fetch ONLY the
+    base commit at depth 1 (~150MB), which is the one thing SWE-bench needs. 20x
+    smaller, and faster over a slow link.
+    """
     wd = root / inst["instance_id"]
     if wd.exists():
         return wd
     wd.parent.mkdir(parents=True, exist_ok=True)
     url = f"https://github.com/{inst['repo']}.git"
     commit = inst["base_commit"]
+    # init + fetch just the one commit at depth 1, rather than clone-everything.
     subprocess.run(["git", "init", "--quiet", str(wd)], check=True, timeout=60)
-    subprocess.run(["git", "-C", str(wd), "remote", "add", "origin", url], check=True, timeout=60)
+    subprocess.run(["git", "-C", str(wd), "remote", "add", "origin", url],
+                   check=True, timeout=60)
     try:
         subprocess.run(["git", "-C", str(wd), "fetch", "--quiet", "--depth", "1",
                         "origin", commit], check=True, timeout=900)
         subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", "FETCH_HEAD"],
                        check=True, timeout=300)
     except subprocess.CalledProcessError:
+        # Some servers won't let you fetch an arbitrary SHA directly. Fall back to a
+        # shallow clone of the default branch, then check the commit out (still far
+        # smaller than a full clone if the commit is recent-ish).
         import shutil
         shutil.rmtree(wd, ignore_errors=True)
         subprocess.run(["git", "clone", "--quiet", "--depth", "50", url, str(wd)],
-                       check=True, timeout=300)
+                       check=True, timeout=900)
         subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", commit],
                        check=True, timeout=300)
     return wd
@@ -181,6 +194,7 @@ def run_one(inst: dict, args, logdir: Path) -> dict:
     base = args.proxy_base_url.rstrip("/")
     cfg = {
         "task_id": iid,
+        "run_id": args.run_id,
         "workdir": str(wd),
         "model": args.model,
         # Session also encoded in the path, in case litellm drops extra_headers.
@@ -215,6 +229,7 @@ def main() -> int:
     ap.add_argument("--subset", default="lite")
     ap.add_argument("--split", default="test")
     ap.add_argument("--model", default=os.environ.get("MODEL", "Qwen/Qwen3-8B"))
+    ap.add_argument("--run-id", default="default")
     ap.add_argument("--proxy-base-url",
                     default=os.environ.get("PROXY_BASE_URL", "http://127.0.0.1:9000"))
     ap.add_argument("--task-timeout", type=int, default=3600)

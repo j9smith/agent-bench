@@ -14,7 +14,8 @@ from pathlib import Path
 import httpx, pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-LOG = ROOT / "logs" / "e2e_requests.jsonl"
+LOGDIR = ROOT / "logs" / "_test_e2e"
+LOG = LOGDIR / "default" / "requests.jsonl"
 UPSTREAM, PROXY = 8110, 8111
 PROM = {"vllm": 8112, "sglang": 8113}
 failures = []
@@ -40,7 +41,7 @@ def turn(sid, stype, msgs):
 def main():
     LOG.parent.mkdir(parents=True, exist_ok=True); LOG.unlink(missing_ok=True)
     base = {**os.environ, "UPSTREAM_BASE_URL": f"http://127.0.0.1:{UPSTREAM}",
-            "PROXY_LOG_PATH": str(LOG), "PYTHONPATH": str(ROOT)}
+            "PROXY_LOG_DIR": str(LOGDIR), "PYTHONPATH": str(ROOT)}
     procs = [
         subprocess.Popen([sys.executable, "-m", "uvicorn", "tools.mock_vllm:app",
                           "--port", str(UPSTREAM), "--log-level", "error"], cwd=ROOT, env=base),

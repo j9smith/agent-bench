@@ -73,6 +73,7 @@ def write_task_config(instance_id: str, args, cfgdir: Path) -> Path:
                 "extra_headers": {
                     "X-Session-Id": instance_id,
                     "X-Session-Type": "agentic",
+                    "X-Run-Id": args.run_id,
                 },
             },
         },
@@ -125,6 +126,7 @@ def main() -> int:
     ap.add_argument("--split", default="test")
     ap.add_argument("--model", default=os.environ.get("MODEL", "Qwen/Qwen3-8B"),
                     help="model id as served by vLLM (no provider prefix)")
+    ap.add_argument("--run-id", default="default")
     ap.add_argument("--proxy-base-url", default=os.environ.get("PROXY_BASE_URL",
                                                                "http://127.0.0.1:9000"))
     ap.add_argument("--temperature", type=float, default=0.0)

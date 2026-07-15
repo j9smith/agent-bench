@@ -21,7 +21,8 @@ from pathlib import Path
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
-LOG = ROOT / "logs" / "verify_requests.jsonl"
+LOGDIR = ROOT / "logs" / "_test_verify"
+LOG = LOGDIR / "default" / "requests.jsonl"
 UPSTREAM, PROXY = 8100, 8101
 REQ = {"model": "mock", "stream": True,
        "messages": [{"role": "system", "content": "you are an agent"},
@@ -61,7 +62,7 @@ def main():
     LOG.unlink(missing_ok=True)
     env = {**os.environ,
            "UPSTREAM_BASE_URL": f"http://127.0.0.1:{UPSTREAM}",
-           "PROXY_LOG_PATH": str(LOG),
+           "PROXY_LOG_DIR": str(LOGDIR),
            "PROXY_INJECT_USAGE": "1",
            "PYTHONPATH": str(ROOT)}
 

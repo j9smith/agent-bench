@@ -26,7 +26,8 @@ import httpx
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-LOG = ROOT / "logs" / "branch_requests.jsonl"
+LOGDIR = ROOT / "logs" / "_test_branch"
+LOG = LOGDIR / "default" / "requests.jsonl"
 OUT = ROOT / "analysis" / "branch"
 UPSTREAM, PROXY, PROM = 8120, 8121, 8122
 SYS = {"role": "system", "content": "You are a coding agent. " + "TOOLS. " * 200}
@@ -65,7 +66,7 @@ def main():
     LOG.parent.mkdir(parents=True, exist_ok=True)
     LOG.unlink(missing_ok=True)
     env = {**os.environ, "UPSTREAM_BASE_URL": f"http://127.0.0.1:{UPSTREAM}",
-           "PROXY_LOG_PATH": str(LOG), "PYTHONPATH": str(ROOT)}
+           "PROXY_LOG_DIR": str(LOGDIR), "PYTHONPATH": str(ROOT)}
     procs = [
         subprocess.Popen([sys.executable, "-m", "uvicorn", "tools.mock_vllm:app",
                           "--port", str(UPSTREAM), "--log-level", "error"], cwd=ROOT, env=env),
