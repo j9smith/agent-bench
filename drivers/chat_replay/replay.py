@@ -58,6 +58,7 @@ def replay_one(conv_idx: int, msgs: list[dict], args) -> None:
     base = args.proxy_base_url.rstrip("/")
     url = f"{base}/sess/chat/{session_id}/v1/chat/completions"
     headers = {"X-Session-Id": session_id, "X-Session-Type": "chat",
+               "X-Run-Id": args.run_id,
                "Authorization": f"Bearer {os.environ.get('PROXY_API_KEY', 'dummy')}"}
 
     history: list[dict] = []
@@ -113,6 +114,7 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--model", default=os.environ.get("MODEL", "Qwen/Qwen3-8B"))
+    ap.add_argument("--run-id", default="default")
     ap.add_argument("--proxy-base-url",
                     default=os.environ.get("PROXY_BASE_URL", "http://127.0.0.1:9000"))
     args = ap.parse_args()

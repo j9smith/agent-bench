@@ -13,7 +13,7 @@ set -a; source ab.env; set +a
 : "${MODEL:?set MODEL in ab.env}"
 : "${API_KEY:?set API_KEY in ab.env}"
 VLLM_PORT="${VLLM_PORT:-8000}"; PROXY_PORT="${PROXY_PORT:-9000}"; PROM_PORT="${PROM_PORT:-9090}"
-PROM_DIR="${PROM_DIR:-/workspace/.prometheus}"; SCRAPE_INTERVAL="${SCRAPE_INTERVAL:-5}"; RUN_ID="${RUN_ID:-run1}"
+PROM_DIR="${PROM_DIR:-/workspace/.prometheus}"; SCRAPE_INTERVAL="${SCRAPE_INTERVAL:-5}"
 
 PY="python"; [[ -x "$HERE/.venv/bin/python" ]] && PY="$HERE/.venv/bin/python"
 c_grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
@@ -43,7 +43,7 @@ ensure_prometheus(){
   c_dim "installing prometheus once -> $PROM_DIR (persistent)..."
   mkdir -p "$PROM_DIR"; local ver="2.54.1"
   curl -sL "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz" \
-    | tar xz -C "$PROM_DIR" --strip-components=1
+    | tar xz -C "$PROM_DIR" --strip-components=1 --no-same-owner
   c_grn "prometheus installed (survives pod restarts)."
 }
 write_prom_config(){
@@ -62,14 +62,14 @@ EOF
 }
 
 cmd_up(){
-  need_nc; mkdir -p logs "logs/$RUN_ID"
+  need_nc; mkdir -p logs
   if [[ "$(up_or_down "$PROXY_PORT")" == up ]]; then c_dim "proxy already up on :$PROXY_PORT"; else
-    RUN_ID="$RUN_ID" UPSTREAM_BASE_URL="http://localhost:$VLLM_PORT" PROXY_API_KEY="$API_KEY" \
-      PROXY_LOG_PATH="logs/$RUN_ID/requests.jsonl" PROXY_INJECT_USAGE="${INJECT_USAGE:-1}" \
+    UPSTREAM_BASE_URL="http://localhost:$VLLM_PORT" PROXY_API_KEY="$API_KEY" \
+      PROXY_LOG_DIR="logs" PROXY_INJECT_USAGE="${INJECT_USAGE:-1}" \
       nohup "$PY" -m uvicorn proxy.main:app --host 0.0.0.0 --port "$PROXY_PORT" --log-level warning \
       > logs/proxy.log 2>&1 &
     sleep 2
-    [[ "$(up_or_down "$PROXY_PORT")" == up ]] && c_grn "proxy up on :$PROXY_PORT -> logs/$RUN_ID/requests.jsonl" \
+    [[ "$(up_or_down "$PROXY_PORT")" == up ]] && c_grn "proxy up on :$PROXY_PORT (routes by run id -> logs/<run>/)" \
       || { c_red "proxy failed:"; tail -5 logs/proxy.log; }
   fi
   ensure_prometheus; write_prom_config
@@ -89,15 +89,18 @@ cmd_down(){
 
 cmd_run(){
   local driver="${1:-}"; shift || true
-  [[ -z "$driver" ]] && { echo "usage: ab run <agentic|openhands|chat> [-c N] [-n N] [-r RUN] [--delegation] [--condenser]"; exit 1; }
-  local conc=1 ntasks=1 run="$RUN_ID" extra=()
+  local run="${1:-}"; shift || true
+  [[ -z "$driver" || -z "$run" ]] && { echo "usage: ab run <agentic|openhands|chat> <run-name> [-c N] [-n N] [--delegation] [--condenser]"; exit 1; }
+  local conc=1 ntasks=1 extra=()
   while [[ $# -gt 0 ]]; do case "$1" in
-    -c) conc="$2"; shift 2;; -n) ntasks="$2"; shift 2;; -r) run="$2"; shift 2;;
+    -c) conc="$2"; shift 2;; -n) ntasks="$2"; shift 2;;
     --delegation) extra+=(--delegation); shift;; --condenser) extra+=(--condenser); shift;;
     *) extra+=("$1"); shift;; esac; done
-  if [[ "$run" != "$RUN_ID" ]]; then
-    c_red "NOTE: -r $run != ab.env RUN_ID=$RUN_ID. Proxy logs to the RUN_ID it was started with."
-    c_red "  restart: edit RUN_ID in ab.env, then 'ab down && ab up'."
+  # run name is sent per-request as X-Run-Id; the proxy routes it to logs/<run>/.
+  # NO proxy restart needed between runs. That's the whole point of this refactor.
+  if [[ -e "logs/$run/requests.jsonl" ]]; then
+    c_red "logs/$run/ already exists - pick a fresh name or rm it, else runs mix."
+    exit 1
   fi
   export PROXY_API_KEY="$API_KEY"
   local base="http://localhost:$PROXY_PORT"
@@ -106,15 +109,16 @@ cmd_run(){
     agentic)   "$PY" -m drivers.agentic.run_agentic --concurrency "$conc" --num-tasks "$ntasks" \
                  --model "$MODEL" --proxy-base-url "$base" --environment-class local "${extra[@]}" ;;
     openhands) "$PY" -m drivers.openhands.run_openhands --concurrency "$conc" --num-tasks "$ntasks" \
-                 --model "$MODEL" --proxy-base-url "$base" "${extra[@]}" ;;
+                 --model "$MODEL" --proxy-base-url "$base" --run-id "$run" "${extra[@]}" ;;
     chat)      [[ -f data/sharegpt.json ]] || "$PY" drivers/chat_replay/fetch_sharegpt.py
                "$PY" -m drivers.chat_replay.replay --num-conversations "$ntasks" --concurrency "$conc" \
-                 --model "$MODEL" --proxy-base-url "$base" "${extra[@]}" ;;
+                 --model "$MODEL" --proxy-base-url "$base" --run-id "$run" "${extra[@]}" ;;
     *) c_red "unknown driver: $driver"; exit 1;; esac
 }
 
 cmd_watch(){
-  need_tmux; local run="${1:-$RUN_ID}"; local log="logs/$run/requests.jsonl"
+  need_tmux; local run="${1:-}"; [[ -z "$run" ]] && { echo "usage: ab watch <run-name>"; exit 1; }
+  local log="logs/$run/requests.jsonl"
   mkdir -p "logs/$run"; touch "$log"
   tmux kill-session -t abwatch 2>/dev/null || true
   tmux new-session -d -s abwatch \
@@ -132,7 +136,8 @@ cmd_metrics(){
     || c_red "vLLM not reachable on :$VLLM_PORT"
 }
 cmd_show(){
-  local run="${1:-$RUN_ID}"; local log="logs/$run/requests.jsonl"
+  local run="${1:-}"; [[ -z "$run" ]] && { echo "usage: ab show <run-name>"; exit 1; }
+  local log="logs/$run/requests.jsonl"
   [[ -f "$log" ]] || { c_red "no log at $log"; exit 1; }
   "$PY" ab_helpers/show_run.py "$log"
   c_dim "exporting joined table..."
@@ -146,7 +151,7 @@ cmd_status(){
   p=$([[ "$(up_or_down "$PROXY_PORT")" == up ]] && c_grn up || c_red down)
   m=$([[ "$(up_or_down "$PROM_PORT")"  == up ]] && c_grn up || c_red down)
   echo "vLLM   :$VLLM_PORT   $v"; echo "proxy  :$PROXY_PORT   $p"; echo "prom   :$PROM_PORT   $m"
-  echo "run id       $RUN_ID  -> logs/$RUN_ID/requests.jsonl"
+  echo "runs so far  $(ls logs/ 2>/dev/null | tr '\n' ' ' || echo none)"
   tmux has-session -t vllm 2>/dev/null && c_dim "vLLM tmux alive (tmux attach -t vllm)" || true
 }
 
@@ -163,7 +168,7 @@ ab - agentic-bench control
   ab vllm-down          stop vLLM
   ab up                 start proxy + prometheus (installs prom once)
   ab down               stop proxy + prometheus
-  ab run <driver> ...   agentic | openhands | chat  [-c conc] [-n tasks] [-r run]
+  ab run <driver> <name>  agentic | openhands | chat  [-c conc] [-n tasks]
                         openhands also: --delegation --condenser
   ab watch [run]        live tmux dashboard (metrics + turns + agent stdout)
   ab watch-kill         close dashboard
@@ -176,9 +181,9 @@ ab - agentic-bench control
   first session:
     ab vllm-up && sleep 90 && ab status
     ab up
-    ab run openhands -c 8 -n 8
-    ab watch          # (in another shell, or run it first)
-    ab show
+    ab run openhands myrun -c 8 -n 8
+    ab watch myrun    # (in another shell, or run it first)
+    ab show myrun
 EOF
   ;;
 esac

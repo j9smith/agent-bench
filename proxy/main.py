@@ -49,7 +49,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 UPSTREAM_BASE_URL = os.environ.get("UPSTREAM_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-LOG_PATH = Path(os.environ.get("PROXY_LOG_PATH", "logs/requests.jsonl"))
 INJECT_USAGE = os.environ.get("PROXY_INJECT_USAGE", "1") not in ("0", "false", "False")
 REQUEST_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT_S", "1800"))
 
@@ -58,25 +57,47 @@ _DROP_REQUEST_HEADERS = {"host", "content-length", "connection", "accept-encodin
 _DROP_RESPONSE_HEADERS = {"content-length", "content-encoding", "transfer-encoding", "connection"}
 
 
-class RequestLog:
-    """Append-only JSONL writer, serialised behind a lock."""
+LOG_DIR = Path(os.environ.get("PROXY_LOG_DIR", "logs"))
+DEFAULT_RUN = os.environ.get("PROXY_DEFAULT_RUN", "default")
 
-    def __init__(self, path: Path):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+class RunRouter:
+    """Routes each request to logs/<run_id>/requests.jsonl, opening files on demand.
+
+    This is what lets one long-lived proxy serve many cleanly-separated runs: the run
+    id arrives per-request (X-Run-Id header), so there's no proxy restart between runs
+    and no cross-run pollution in a single file. Falls back to PROXY_DEFAULT_RUN for
+    requests that carry no run id (e.g. stray health checks).
+    """
+
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self._files: dict[str, Any] = {}
         self._lock = asyncio.Lock()
-        self._fh = self.path.open("a", buffering=1)
+
+    def _sanitize(self, run_id: str) -> str:
+        # never let a header escape the logs dir
+        safe = "".join(c for c in run_id if c.isalnum() or c in "-_.")
+        return safe or DEFAULT_RUN
 
     async def write(self, record: dict[str, Any]) -> None:
+        run = self._sanitize(record.get("run_id") or DEFAULT_RUN)
         line = json.dumps(record, separators=(",", ":"), default=str)
         async with self._lock:
-            self._fh.write(line + "\n")
+            fh = self._files.get(run)
+            if fh is None:
+                path = self.base_dir / run / "requests.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fh = path.open("a", buffering=1)
+                self._files[run] = fh
+            fh.write(line + "\n")
 
     def close(self) -> None:
-        try:
-            self._fh.close()
-        except Exception:
-            pass
+        for fh in self._files.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 class TurnCounter:
@@ -97,9 +118,9 @@ async def lifespan(app: FastAPI):
         base_url=UPSTREAM_BASE_URL,
         timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=30.0),
     )
-    app.state.log = RequestLog(LOG_PATH)
+    app.state.log = RunRouter(LOG_DIR)
     app.state.turns = TurnCounter()
-    print(f"[proxy] upstream={UPSTREAM_BASE_URL} log={LOG_PATH} inject_usage={INJECT_USAGE}")
+    print(f"[proxy] upstream={UPSTREAM_BASE_URL} log_dir={LOG_DIR} inject_usage={INJECT_USAGE}")
     yield
     await app.state.client.aclose()
     app.state.log.close()
@@ -265,6 +286,7 @@ async def proxy(path: str, request: Request):
     # sequence_id has to be DERIVED, not declared. It's the hash of the conversation
     # root; see compute_hashes.
     task_id = request.headers.get("X-Task-Id") or session_id
+    run_id = request.headers.get("X-Run-Id")  # routes the log file; None -> default
 
     h = compute_hashes(body)
     sequence_id = h["sequence_root"]
@@ -284,6 +306,7 @@ async def proxy(path: str, request: Request):
 
     record: dict[str, Any] = {
         "request_id": str(uuid.uuid4()),
+        "run_id": run_id,
         "task_id": task_id,
         "session_id": session_id,
         "sequence_id": sequence_id,
