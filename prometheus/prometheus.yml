@@ -1,0 +1,22 @@
+# Both engines are scraped by the same Prometheus. Only one is up at a time (they
+# want the same GPU), so the other job just fails its scrapes -- which is fine and
+# is why export_metrics.py probes for whichever series actually has data.
+#
+# scrape_interval MUST match export_metrics.py --step, or counter deltas silently
+# misalign with the requests they're supposed to describe.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: vllm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['GPU_POD_HOST:8000']    # replace; not localhost unless you're on the pod
+        labels: {engine: vllm}
+
+  - job_name: sglang
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['GPU_POD_HOST:30000']
+        labels: {engine: sglang}

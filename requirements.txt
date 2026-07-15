@@ -1,0 +1,16 @@
+# proxy
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+
+# drivers
+mini-swe-agent>=2.0      # linear scaffold: unmanaged context growth (the baseline shape)
+openhands-sdk>=1.36      # delegation + condensation toggles
+openhands-tools>=1.36
+datasets>=2.20
+PyYAML>=6.0
+
+# analysis
+pandas>=2.2
+pyarrow>=16.0
+requests>=2.32
