@@ -109,10 +109,20 @@ SERVER_SCHEMA = [
 ]
 
 
+class PrometheusUnreachable(Exception):
+    """Prometheus isn't answering at all -- distinct from 'answered, no data'."""
+
+
 def query_range(base, expr, start, end, step):
-    r = requests.get(f"{base}/api/v1/query_range",
-                     params={"query": expr, "start": start, "end": end, "step": step},
-                     timeout=60)
+    try:
+        r = requests.get(f"{base}/api/v1/query_range",
+                         params={"query": expr, "start": start, "end": end, "step": step},
+                         timeout=60)
+    except requests.exceptions.RequestException as exc:
+        # Connection refused / DNS / timeout: the server isn't there. Surface it as
+        # one clean signal instead of a stack trace, so a missing Prometheus degrades
+        # the export to sender-side-only rather than killing it.
+        raise PrometheusUnreachable(str(exc)) from None
     r.raise_for_status()
     d = r.json()
     return d["data"]["result"] if d.get("status") == "success" else []
@@ -260,10 +270,21 @@ def derive_session_shape(df: pd.DataFrame) -> pd.DataFrame:
     # interleaving of those would produce garbage.
     key = "sequence_id" if "sequence_id" in df.columns else "session_id"
     df = df.sort_values([key, "ts_request_in"], kind="stable").copy()
-    df["ttft_s"] = df["ts_first_byte"] - df["ts_request_in"]
+
+    # e2e is always meaningful: request issued -> last byte back.
     df["e2e_s"] = df["ts_last_byte"] - df["ts_request_in"]
-    decode_s = df["ts_last_byte"] - df["ts_first_byte"]
+
+    # TTFT and ITL only mean something for STREAMED responses. A non-streamed call
+    # (OpenHands' default) returns the whole body at once, so ts_first_byte ==
+    # ts_last_byte and "time to first token" is not a distinct quantity -- reporting
+    # ts_first_byte - ts_request_in as TTFT would be a lie (it's really e2e). So we
+    # null TTFT/ITL where the proxy saw no stream chunks, rather than emit a
+    # misleading ~0 decode window. Chat traffic streams, so it keeps real TTFT/ITL.
+    streamed = df["stream_chunks"].notna() if "stream_chunks" in df.columns else False
+    df["ttft_s"] = (df["ts_first_byte"] - df["ts_request_in"]).where(streamed)
+    decode_s = (df["ts_last_byte"] - df["ts_first_byte"]).where(streamed)
     df["itl_s"] = decode_s / df["completion_tokens"].where(df["completion_tokens"] > 0)
+    df["streamed"] = streamed if isinstance(streamed, bool) else streamed.fillna(False)
 
     g = df.groupby(key, dropna=True)
     # Gap: wall time from the previous response completing to this request being issued.
@@ -387,44 +408,61 @@ def main() -> int:
         start = float(req["ts_request_in"].min()) - args.step * 2
         end = float(req["ts_last_byte"].max()) + args.step * 2
 
-        if engine == "auto":
-            engine = detect_engine(args.prometheus, start, end, args.step)
-            if not engine:
-                print("[export] could not detect an engine from Prometheus. Is the scrape job "
-                      "up, and does retention cover the run window?", file=sys.stderr)
-                return 3
-            print(f"[export] detected engine: {engine}")
+        try:
+            if engine == "auto":
+                engine = detect_engine(args.prometheus, start, end, args.step)
+                if not engine:
+                    print("[export] Prometheus is up but no engine series matched. Is the "
+                          "scrape job configured, and does retention cover the run window? "
+                          "Writing sender-side-only table.", file=sys.stderr)
+                    engine = "unknown"
+                    raise PrometheusUnreachable("no engine detected")
+                print(f"[export] detected engine: {engine}")
 
-        # Archive FIRST. The joined table is a lossy reduction of this; if the reduction
-        # turns out to be the wrong one, we want the inputs still on disk.
-        if not args.no_raw:
-            n_raw = dump_raw_series(args.prometheus, engine, start, end, args.step,
-                                    (args.out.parent if args.out else ROOT / "analysis")
-                                    / f"raw_series_{engine}")
+            # Archive FIRST. The joined table is a lossy reduction of this; if the
+            # reduction turns out wrong, we want the inputs still on disk.
+            if not args.no_raw:
+                n_raw = dump_raw_series(args.prometheus, engine, start, end, args.step,
+                                        (args.out.parent if args.out else ROOT / "analysis")
+                                        / f"raw_series_{engine}")
 
-        srv, resolved = server_frame(args.prometheus, engine, start, end, args.step)
-        if resolved:
-            print("[export] resolved series:")
-            for k, v in resolved.items():
-                print(f"           {k:<26} -> {v}")
+            srv, resolved = server_frame(args.prometheus, engine, start, end, args.step)
+            if resolved:
+                print("[export] resolved series:")
+                for k, v in resolved.items():
+                    print(f"           {k:<26} -> {v}")
 
-        if srv.empty:
-            print("[export] Prometheus returned nothing for the run window.", file=sys.stderr)
-            for col in ["ts"] + SERVER_SCHEMA:      # schema holds even on a failed scrape
+            if srv.empty:
+                print("[export] Prometheus returned nothing for the run window.",
+                      file=sys.stderr)
+                for col in ["ts"] + SERVER_SCHEMA:
+                    req[col] = pd.NA
+            else:
+                req = pd.merge_asof(
+                    req.sort_values("ts_request_in"), srv.sort_values("ts"),
+                    left_on="ts_request_in", right_on="ts",
+                    direction="backward", tolerance=float(args.step * 2))
+                print(f"[export] joined server metrics to "
+                      f"{req['ts'].notna().mean():.0%} of requests")
+                ev = req.get("eviction_events")
+                if ev is not None and pd.notna(ev.max()) and ev.max() == 0:
+                    print("[export] NOTE: eviction/preemption count never left zero. The "
+                          "KV pool never filled, so nothing about eviction or admission is "
+                          "answerable from this run. Raise --concurrency, or shrink the pool.")
+
+        except PrometheusUnreachable as exc:
+            # The whole point of the fix: a missing/empty Prometheus must NOT lose you
+            # the sender-side table, which is most of section 0 anyway.
+            print(f"[export] Prometheus unreachable at {args.prometheus} ({exc}).",
+                  file=sys.stderr)
+            print("[export] Writing sender-side-only table. Start Prometheus and re-run "
+                  "to attach server-side metrics -- the raw request log is unchanged, so "
+                  "nothing is lost as long as Prometheus retention still covers the window.",
+                  file=sys.stderr)
+            for col in ["ts"] + SERVER_SCHEMA:
                 req[col] = pd.NA
-        else:
-            req = pd.merge_asof(
-                req.sort_values("ts_request_in"), srv.sort_values("ts"),
-                left_on="ts_request_in", right_on="ts",
-                direction="backward", tolerance=float(args.step * 2))
-            print(f"[export] joined server metrics to {req['ts'].notna().mean():.0%} of requests")
-            ev = req.get("eviction_events")
-            if ev is not None and pd.notna(ev.max()) and ev.max() == 0:
-                print("[export] NOTE: eviction/preemption count never left zero. The KV pool "
-                      "never filled, so nothing about eviction or admission is answerable from "
-                      "this run. Raise --concurrency, or shrink the pool.")
 
-    req["engine"] = engine if engine != "auto" else None
+    req["engine"] = engine if engine not in ("auto", "unknown") else None
 
     out = args.out or (ROOT / "analysis" / f"results_{engine}")
     out.parent.mkdir(parents=True, exist_ok=True)

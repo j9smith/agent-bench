@@ -4,3 +4,7 @@ analysis/*.csv
 analysis/*.parquet
 __pycache__/
 *.pyc
+README.md
+QUICKSTART.md
+CHEATSHEET.md
+TMUX_CHEATSHEET.md

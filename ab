@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# ab - one command to run the agentic-bench harness. See `ab` with no args.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+if [[ ! -f ab.env ]]; then
+  echo "No ab.env found. Create it:  cp ab.env.example ab.env  then edit it." >&2
+  exit 1
+fi
+set -a; source ab.env; set +a
+
+: "${MODEL:?set MODEL in ab.env}"
+: "${API_KEY:?set API_KEY in ab.env}"
+VLLM_PORT="${VLLM_PORT:-8000}"; PROXY_PORT="${PROXY_PORT:-9000}"; PROM_PORT="${PROM_PORT:-9090}"
+PROM_DIR="${PROM_DIR:-/workspace/.prometheus}"; SCRAPE_INTERVAL="${SCRAPE_INTERVAL:-5}"; RUN_ID="${RUN_ID:-run1}"
+
+PY="python"; [[ -x "$HERE/.venv/bin/python" ]] && PY="$HERE/.venv/bin/python"
+c_grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
+c_red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+c_dim(){ printf '\033[2m%s\033[0m\n' "$*"; }
+up_or_down(){ if nc -z localhost "$1" 2>/dev/null; then echo up; else echo down; fi; }
+need_tmux(){ command -v tmux >/dev/null 2>&1 && return 0; c_dim "installing tmux..."; apt-get update -qq && apt-get install -y -qq tmux; }
+need_nc(){ command -v nc >/dev/null 2>&1 && return 0; apt-get update -qq && apt-get install -y -qq netcat-openbsd; }
+
+cmd_vllm_up(){
+  need_tmux
+  if tmux has-session -t vllm 2>/dev/null; then
+    c_red "vLLM tmux session exists. 'ab vllm-down' first, or 'tmux attach -t vllm'."; return 1; fi
+  local args="serve $MODEL --host 0.0.0.0 --port $VLLM_PORT --api-key $API_KEY \
+--max-model-len ${MAX_MODEL_LEN:-40960} --gpu-memory-utilization ${GPU_UTIL:-0.90} \
+--enable-auto-tool-choice --tool-call-parser ${TOOL_CALL_PARSER:-hermes} \
+--enable-prefix-caching --served-model-name $MODEL ${EXTRA_VLLM_ARGS:-}"
+  c_dim "launching vLLM in tmux session 'vllm'..."
+  tmux new-session -d -s vllm "vllm $args 2>&1 | tee $HERE/logs/vllm.log"
+  c_grn "vLLM launching. Watch boot: tmux attach -t vllm  (detach: Ctrl-b then d)"
+  c_dim "~1-2 min to load weights. 'ab status' to check readiness."
+}
+cmd_vllm_down(){ tmux kill-session -t vllm 2>/dev/null && c_grn "vLLM stopped." || c_dim "no vLLM session."; }
+
+ensure_prometheus(){
+  [[ -x "$PROM_DIR/prometheus" ]] && return 0
+  c_dim "installing prometheus once -> $PROM_DIR (persistent)..."
+  mkdir -p "$PROM_DIR"; local ver="2.54.1"
+  curl -sL "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz" \
+    | tar xz -C "$PROM_DIR" --strip-components=1
+  c_grn "prometheus installed (survives pod restarts)."
+}
+write_prom_config(){
+  cat > "$PROM_DIR/ab-prometheus.yml" <<EOF
+global:
+  scrape_interval: ${SCRAPE_INTERVAL}s
+  evaluation_interval: ${SCRAPE_INTERVAL}s
+scrape_configs:
+  - job_name: vllm
+    metrics_path: /metrics
+    static_configs: [{targets: ['localhost:${VLLM_PORT}'], labels: {engine: vllm}}]
+  - job_name: sglang
+    metrics_path: /metrics
+    static_configs: [{targets: ['localhost:30000'], labels: {engine: sglang}}]
+EOF
+}
+
+cmd_up(){
+  need_nc; mkdir -p logs "logs/$RUN_ID"
+  if [[ "$(up_or_down "$PROXY_PORT")" == up ]]; then c_dim "proxy already up on :$PROXY_PORT"; else
+    RUN_ID="$RUN_ID" UPSTREAM_BASE_URL="http://localhost:$VLLM_PORT" PROXY_API_KEY="$API_KEY" \
+      PROXY_LOG_PATH="logs/$RUN_ID/requests.jsonl" PROXY_INJECT_USAGE="${INJECT_USAGE:-1}" \
+      nohup "$PY" -m uvicorn proxy.main:app --host 0.0.0.0 --port "$PROXY_PORT" --log-level warning \
+      > logs/proxy.log 2>&1 &
+    sleep 2
+    [[ "$(up_or_down "$PROXY_PORT")" == up ]] && c_grn "proxy up on :$PROXY_PORT -> logs/$RUN_ID/requests.jsonl" \
+      || { c_red "proxy failed:"; tail -5 logs/proxy.log; }
+  fi
+  ensure_prometheus; write_prom_config
+  if [[ "$(up_or_down "$PROM_PORT")" == up ]]; then c_dim "prometheus already up on :$PROM_PORT"; else
+    nohup "$PROM_DIR/prometheus" --config.file="$PROM_DIR/ab-prometheus.yml" \
+      --storage.tsdb.path="$PROM_DIR/data" --storage.tsdb.retention.time=30d \
+      --web.listen-address="0.0.0.0:$PROM_PORT" > logs/prometheus.log 2>&1 &
+    sleep 3
+    [[ "$(up_or_down "$PROM_PORT")" == up ]] && c_grn "prometheus up on :$PROM_PORT (scrape ${SCRAPE_INTERVAL}s)" \
+      || { c_red "prometheus failed:"; tail -5 logs/prometheus.log; }
+  fi
+}
+cmd_down(){
+  pkill -f "uvicorn proxy.main" 2>/dev/null && c_grn "proxy stopped." || c_dim "no proxy."
+  pkill -f "$PROM_DIR/prometheus" 2>/dev/null && c_grn "prometheus stopped." || c_dim "no prometheus."
+}
+
+cmd_run(){
+  local driver="${1:-}"; shift || true
+  [[ -z "$driver" ]] && { echo "usage: ab run <agentic|openhands|chat> [-c N] [-n N] [-r RUN] [--delegation] [--condenser]"; exit 1; }
+  local conc=1 ntasks=1 run="$RUN_ID" extra=()
+  while [[ $# -gt 0 ]]; do case "$1" in
+    -c) conc="$2"; shift 2;; -n) ntasks="$2"; shift 2;; -r) run="$2"; shift 2;;
+    --delegation) extra+=(--delegation); shift;; --condenser) extra+=(--condenser); shift;;
+    *) extra+=("$1"); shift;; esac; done
+  if [[ "$run" != "$RUN_ID" ]]; then
+    c_red "NOTE: -r $run != ab.env RUN_ID=$RUN_ID. Proxy logs to the RUN_ID it was started with."
+    c_red "  restart: edit RUN_ID in ab.env, then 'ab down && ab up'."
+  fi
+  export PROXY_API_KEY="$API_KEY"
+  local base="http://localhost:$PROXY_PORT"
+  c_grn "running $driver  concurrency=$conc tasks=$ntasks run=$run"
+  case "$driver" in
+    agentic)   "$PY" -m drivers.agentic.run_agentic --concurrency "$conc" --num-tasks "$ntasks" \
+                 --model "$MODEL" --proxy-base-url "$base" --environment-class local "${extra[@]}" ;;
+    openhands) "$PY" -m drivers.openhands.run_openhands --concurrency "$conc" --num-tasks "$ntasks" \
+                 --model "$MODEL" --proxy-base-url "$base" "${extra[@]}" ;;
+    chat)      [[ -f data/sharegpt.json ]] || "$PY" drivers/chat_replay/fetch_sharegpt.py
+               "$PY" -m drivers.chat_replay.replay --num-conversations "$ntasks" --concurrency "$conc" \
+                 --model "$MODEL" --proxy-base-url "$base" "${extra[@]}" ;;
+    *) c_red "unknown driver: $driver"; exit 1;; esac
+}
+
+cmd_watch(){
+  need_tmux; local run="${1:-$RUN_ID}"; local log="logs/$run/requests.jsonl"
+  mkdir -p "logs/$run"; touch "$log"
+  tmux kill-session -t abwatch 2>/dev/null || true
+  tmux new-session -d -s abwatch \
+    "watch -n 2 -t 'curl -s localhost:$VLLM_PORT/metrics | grep -vE \"^#\" | grep -E \"num_requests_running|num_requests_waiting|kv_cache_usage|prefix_cache_(queries|hits)_total|num_preemptions_total|gpu_cache_usage\"'"
+  tmux split-window -t abwatch -v "tail -f '$log' | $PY ab_helpers/watch_turns.py"
+  tmux split-window -t abwatch -h "tail -f logs/openhands/*/stdout.log logs/agentic/*/*.log 2>/dev/null || sleep 999999"
+  tmux select-layout -t abwatch tiled
+  c_grn "dashboard up. detach: Ctrl-b then d.  kill: ab watch-kill"; sleep 1; tmux attach -t abwatch
+}
+cmd_watch_kill(){ tmux kill-session -t abwatch 2>/dev/null && c_grn "killed." || c_dim "no dashboard."; }
+
+cmd_metrics(){
+  curl -s "localhost:$VLLM_PORT/metrics" | grep -vE "^#" | grep -E \
+    "num_requests_running|num_requests_waiting|kv_cache_usage|prefix_cache_(queries|hits)_total|num_preemptions_total|gpu_cache_usage" \
+    || c_red "vLLM not reachable on :$VLLM_PORT"
+}
+cmd_show(){
+  local run="${1:-$RUN_ID}"; local log="logs/$run/requests.jsonl"
+  [[ -f "$log" ]] || { c_red "no log at $log"; exit 1; }
+  "$PY" ab_helpers/show_run.py "$log"
+  c_dim "exporting joined table..."
+  "$PY" scripts/export_metrics.py --engine auto --requests "$log" \
+    --prometheus "http://localhost:$PROM_PORT" --step "$SCRAPE_INTERVAL" --out "analysis/results_$run" \
+    || c_red "export failed (prometheus up? 'ab up'). raw log still at $log."
+}
+cmd_status(){
+  need_nc; local v p m
+  if curl -s -o /dev/null --max-time 3 -H "Authorization: Bearer $API_KEY" "localhost:$VLLM_PORT/v1/models" 2>/dev/null; then v="$(c_grn up)"; else v="$(c_red down)"; fi
+  p=$([[ "$(up_or_down "$PROXY_PORT")" == up ]] && c_grn up || c_red down)
+  m=$([[ "$(up_or_down "$PROM_PORT")"  == up ]] && c_grn up || c_red down)
+  echo "vLLM   :$VLLM_PORT   $v"; echo "proxy  :$PROXY_PORT   $p"; echo "prom   :$PROM_PORT   $m"
+  echo "run id       $RUN_ID  -> logs/$RUN_ID/requests.jsonl"
+  tmux has-session -t vllm 2>/dev/null && c_dim "vLLM tmux alive (tmux attach -t vllm)" || true
+}
+
+case "${1:-}" in
+  vllm-up) cmd_vllm_up ;; vllm-down) cmd_vllm_down ;;
+  up) cmd_up ;; down) cmd_down ;;
+  run) shift; cmd_run "$@" ;;
+  watch) shift; cmd_watch "$@" ;; watch-kill) cmd_watch_kill ;;
+  metrics) cmd_metrics ;; show) shift; cmd_show "$@" ;; status) cmd_status ;;
+  *) cat <<EOF
+ab - agentic-bench control
+
+  ab vllm-up            launch vLLM (tmux session, restartable, you own it)
+  ab vllm-down          stop vLLM
+  ab up                 start proxy + prometheus (installs prom once)
+  ab down               stop proxy + prometheus
+  ab run <driver> ...   agentic | openhands | chat  [-c conc] [-n tasks] [-r run]
+                        openhands also: --delegation --condenser
+  ab watch [run]        live tmux dashboard (metrics + turns + agent stdout)
+  ab watch-kill         close dashboard
+  ab metrics            one-shot vLLM metrics
+  ab show [run]         turn table + errors + export joined table
+  ab status             what's up
+
+  config: ab.env  (cp ab.env.example ab.env)
+
+  first session:
+    ab vllm-up && sleep 90 && ab status
+    ab up
+    ab run openhands -c 8 -n 8
+    ab watch          # (in another shell, or run it first)
+    ab show
+EOF
+  ;;
+esac
