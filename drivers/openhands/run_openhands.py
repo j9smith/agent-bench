@@ -147,17 +147,28 @@ def swebench_instances(subset: str, split: str, n: int, shuffle: bool) -> list[d
 
 
 def prepare_workspace(inst: dict, root: Path) -> Path:
-    """Check out the repo at the task's base commit. Cheap, and avoids depending on
-    the SWE-bench Docker images being buildable, which is the flakiest part of the
-    whole stack. Tests still run -- they just run in this checkout."""
+    """Shallow (depth-1) checkout of the base commit, so N concurrent tasks
+    don't fill the disk with git history. ~150MB vs ~2.9GB per repo."""
     wd = root / inst["instance_id"]
     if wd.exists():
         return wd
     wd.parent.mkdir(parents=True, exist_ok=True)
     url = f"https://github.com/{inst['repo']}.git"
-    subprocess.run(["git", "clone", "--quiet", url, str(wd)], check=True, timeout=900)
-    subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", inst["base_commit"]],
-                   check=True, timeout=300)
+    commit = inst["base_commit"]
+    subprocess.run(["git", "init", "--quiet", str(wd)], check=True, timeout=60)
+    subprocess.run(["git", "-C", str(wd), "remote", "add", "origin", url], check=True, timeout=60)
+    try:
+        subprocess.run(["git", "-C", str(wd), "fetch", "--quiet", "--depth", "1",
+                        "origin", commit], check=True, timeout=900)
+        subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", "FETCH_HEAD"],
+                       check=True, timeout=300)
+    except subprocess.CalledProcessError:
+        import shutil
+        shutil.rmtree(wd, ignore_errors=True)
+        subprocess.run(["git", "clone", "--quiet", "--depth", "50", url, str(wd)],
+                       check=True, timeout=300)
+        subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", commit],
+                       check=True, timeout=300)
     return wd
 
 
