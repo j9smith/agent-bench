@@ -87,33 +87,86 @@ cmd_down(){
   pkill -f "$PROM_DIR/prometheus" 2>/dev/null && c_grn "prometheus stopped." || c_dim "no prometheus."
 }
 
-cmd_run(){
-  local driver="${1:-}"; shift || true
-  local run="${1:-}"; shift || true
-  [[ -z "$driver" || -z "$run" ]] && { echo "usage: ab run <agentic|openhands|chat> <run-name> [-c N] [-n N] [--delegation] [--condenser]"; exit 1; }
-  local conc=1 ntasks=1 extra=()
-  while [[ $# -gt 0 ]]; do case "$1" in
-    -c) conc="$2"; shift 2;; -n) ntasks="$2"; shift 2;;
-    --delegation) extra+=(--delegation); shift;; --condenser) extra+=(--condenser); shift;;
-    *) extra+=("$1"); shift;; esac; done
-  # run name is sent per-request as X-Run-Id; the proxy routes it to logs/<run>/.
-  # NO proxy restart needed between runs. That's the whole point of this refactor.
-  if [[ -e "logs/$run/requests.jsonl" ]]; then
-    c_red "logs/$run/ already exists - pick a fresh name or rm it, else runs mix."
-    exit 1
-  fi
+# Run one driver invocation against run-id $2 at concurrency $3, tasks $4, extra args $5+.
+# Factored out so both single runs and sweep points share exactly one code path.
+_run_one(){
+  local driver="$1" run="$2" conc="$3" ntasks="$4"; shift 4
+  local extra=("$@")
   export PROXY_API_KEY="$API_KEY"
   local base="http://localhost:$PROXY_PORT"
   c_grn "running $driver  concurrency=$conc tasks=$ntasks run=$run"
   case "$driver" in
     agentic)   "$PY" -m drivers.agentic.run_agentic --concurrency "$conc" --num-tasks "$ntasks" \
-                 --model "$MODEL" --proxy-base-url "$base" --environment-class local "${extra[@]}" ;;
+                 --model "$MODEL" --proxy-base-url "$base" --run-id "$run" \
+                 --environment-class local "${extra[@]}" ;;
     openhands) "$PY" -m drivers.openhands.run_openhands --concurrency "$conc" --num-tasks "$ntasks" \
                  --model "$MODEL" --proxy-base-url "$base" --run-id "$run" "${extra[@]}" ;;
     chat)      [[ -f data/sharegpt.json ]] || "$PY" drivers/chat_replay/fetch_sharegpt.py
                "$PY" -m drivers.chat_replay.replay --num-conversations "$ntasks" --concurrency "$conc" \
                  --model "$MODEL" --proxy-base-url "$base" --run-id "$run" "${extra[@]}" ;;
-    *) c_red "unknown driver: $driver"; exit 1;; esac
+    *) c_red "unknown driver: $driver"; return 2;; esac
+}
+
+# Clear SWE-bench repo checkouts between sweep points so disk stays flat across a long
+# unattended sweep (each point re-clones; without this they accumulate).
+_clean_workspaces(){ rm -rf logs/openhands/_workspaces/* logs/agentic/_workspaces/* 2>/dev/null || true; }
+
+cmd_run(){
+  local driver="${1:-}"; shift || true
+  local run="${1:-}"; shift || true
+  [[ -z "$driver" || -z "$run" ]] && { echo "usage: ab run <agentic|openhands|chat> <run-name> [-c N] [-n N] [--sweep C1,C2,..] [--delegation] [--condenser]"; exit 1; }
+  local conc=1 ntasks=0 sweep="" extra=()
+  while [[ $# -gt 0 ]]; do case "$1" in
+    -c) conc="$2"; shift 2;; -n) ntasks="$2"; shift 2;;
+    --sweep) sweep="$2"; shift 2;;
+    --delegation) extra+=(--delegation); shift;; --condenser) extra+=(--condenser); shift;;
+    *) extra+=("$1"); shift;; esac; done
+
+  # ---- SWEEP: loop concurrency points, one run-id per point (<run>_c<N>) ----
+  if [[ -n "$sweep" ]]; then
+    # validate: digits and commas only, no spaces (a space would have split the arg).
+    if ! printf '%s' "$sweep" | grep -qE '^[0-9]+(,[0-9]+)*$'; then
+      c_red "--sweep must be a comma list of integers, no spaces (e.g. 8,16,24). got: '$sweep'"
+      exit 1
+    fi
+    local points; IFS=',' read -ra points <<< "$sweep"
+    # per point: -n defaults to the point's concurrency (=c) unless -n given explicitly.
+    # (=c grazes the target then decays; the measured timeseries captures the range.)
+    local manifest="logs/${run}_sweep.json" runs_json="" ok=0 failed=""
+    mkdir -p logs
+    c_grn "sweep '$run': points=[${sweep}]  driver=$driver  (sequential, fail-soft)"
+    for pt in "${points[@]}"; do
+      local pn="${ntasks}"; [[ "$pn" -le 0 ]] && pn="$pt"   # -n=c unless overridden
+      local prun="${run}_c${pt}"
+      if [[ -e "logs/$prun/requests.jsonl" ]]; then
+        c_red "  skip point c$pt: logs/$prun already exists (rm it to redo)"; failed="$failed c$pt(exists)"; continue
+      fi
+      _clean_workspaces
+      c_dim "  --- point c$pt -> run-id $prun (tasks=$pn) ---"
+      if _run_one "$driver" "$prun" "$pt" "$pn" "${extra[@]}"; then
+        ok=$((ok+1)); runs_json="$runs_json\"$prun\","
+      else
+        c_red "  point c$pt FAILED (rc=$?) - continuing sweep"; failed="$failed c$pt(rc)"
+      fi
+    done
+    # manifest: lets the downstream analysis discover the sweep's structure from one file
+    printf '{"name":"%s","driver":"%s","points":[%s],"n_per_point":"%s","runs":[%s]}\n' \
+      "$run" "$driver" "$sweep" "${ntasks:-=c}" "${runs_json%,}" > "$manifest"
+    c_grn "sweep done: $ok/${#points[@]} points ok. manifest: $manifest"
+    [[ -n "$failed" ]] && c_red "  failed points:$failed"
+    return 0
+  fi
+
+  # ---- single run ----
+  [[ "$ntasks" -le 0 ]] && ntasks=1
+  # Guard loosened: a pre-existing dir is a WARNING, not a hard stop -- heterogeneous
+  # runs (openhands + chat into one run-id) intentionally share a dir, and every row is
+  # tagged by run_id + session_type so mixing is separable. Only warn so an accidental
+  # reuse is still visible.
+  if [[ -e "logs/$run/requests.jsonl" ]]; then
+    c_red "note: logs/$run/ already has data; appending (rows are run_id+session_type tagged)."
+  fi
+  _run_one "$driver" "$run" "$conc" "$ntasks" "${extra[@]}"
 }
 
 cmd_watch(){
@@ -169,6 +222,7 @@ ab - agentic-bench control
   ab up                 start proxy + prometheus (installs prom once)
   ab down               stop proxy + prometheus
   ab run <driver> <name>  agentic | openhands | chat  [-c conc] [-n tasks]
+                          [--sweep 8,16,24]  sweep concurrencies (one run per point)
                         openhands also: --delegation --condenser
   ab watch [run]        live tmux dashboard (metrics + turns + agent stdout)
   ab watch-kill         close dashboard

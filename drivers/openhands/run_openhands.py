@@ -132,7 +132,8 @@ print(json.dumps(result["counts"]))
 '''
 
 
-def swebench_instances(subset: str, split: str, n: int, shuffle: bool) -> list[dict]:
+def swebench_instances(subset: str, split: str, n: int, shuffle: bool,
+                       diverse_repos: bool = True) -> list[dict]:
     from datasets import load_dataset
     name = {"lite": "princeton-nlp/SWE-bench_Lite",
             "verified": "princeton-nlp/SWE-bench_Verified",
@@ -144,7 +145,37 @@ def swebench_instances(subset: str, split: str, n: int, shuffle: bool) -> list[d
     if shuffle:
         import random
         random.Random(42).shuffle(rows)
-    return rows[:n] if n > 0 else rows
+
+    if n <= 0:
+        return rows
+
+    if not diverse_repos:
+        # old behaviour: first n after sort/shuffle. Tends to over-sample whichever
+        # repo sorts first (astropy, django), correlating the workload.
+        return rows[:n]
+
+    # Round-robin across repos so N tasks spread over as many distinct codebases as
+    # possible. Picking the alphabetical head gives 6 astropy + 2 django; this gives
+    # one from each repo before taking a second from any. De-correlates the workload:
+    # different repos -> different context structure, different prefix trees, no
+    # accidental cross-sequence cache sharing.
+    from collections import defaultdict, deque
+    by_repo: dict[str, deque] = defaultdict(deque)
+    for r in rows:
+        by_repo[r["repo"]].append(r)
+    queues = list(by_repo.values())
+    picked: list[dict] = []
+    i = 0
+    while len(picked) < n and any(queues):
+        q = queues[i % len(queues)]
+        if q:
+            picked.append(q.popleft())
+        i += 1
+        # drop empty queues so we don't spin forever
+        if i % len(queues) == 0:
+            queues = [q for q in queues if q]
+            i = 0
+    return picked
 
 
 def prepare_workspace(inst: dict, root: Path) -> Path:

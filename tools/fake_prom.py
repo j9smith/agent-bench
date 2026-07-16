@@ -22,6 +22,29 @@ VLLM = {
     "vllm:prefix_cache_hits_total":    lambda i: 700.0 * (i + 1),
     "vllm:prompt_tokens_total":        lambda i: 5000.0 * (i + 1),
     "vllm:generation_tokens_total":    lambda i: 500.0 * (i + 1),
+    # cached tokens counter
+    "vllm:prompt_tokens_cached_total": lambda i: 640.0 * (i + 1),
+    # histograms: sum grows ~ per-window mean * count. mean queue ~ 2.0s, count +4/window.
+    "vllm:request_queue_time_seconds_sum":   lambda i: 8.0 * i,   # d(sum)=8 per window
+    "vllm:request_queue_time_seconds_count": lambda i: 4.0 * i,   # d(count)=4 -> mean=2.0s
+    "vllm:time_to_first_token_seconds_sum":   lambda i: 12.0 * i,
+    "vllm:time_to_first_token_seconds_count": lambda i: 4.0 * i,  # mean=3.0s
+    "vllm:request_prefill_time_seconds_sum":   lambda i: 6.0 * i,
+    "vllm:request_prefill_time_seconds_count": lambda i: 4.0 * i, # mean=1.5s
+    "vllm:request_decode_time_seconds_sum":   lambda i: 40.0 * i,
+    "vllm:request_decode_time_seconds_count": lambda i: 4.0 * i,  # mean=10.0s
+    "vllm:request_prefill_kv_computed_tokens_sum":   lambda i: 20000.0 * i,
+    "vllm:request_prefill_kv_computed_tokens_count": lambda i: 4.0 * i,  # mean=5000 tok
+}
+# Offload series, gated by FAKE_OFFLOAD=1 so we can test both present and absent.
+VLLM_OFFLOAD = {
+    "vllm:external_prefix_cache_queries_total": lambda i: 300.0 * (i + 1),
+    "vllm:external_prefix_cache_hits_total":    lambda i: 150.0 * (i + 1),  # 0.5 ext rate
+    "vllm:kv_offload_load_bytes_total":         lambda i: 1_000_000.0 * i,
+    "vllm:kv_offload_store_bytes_total":        lambda i: 2_000_000.0 * i,
+    "vllm:kv_offload_load_time_sum":            lambda i: 0.5 * i,
+    "vllm:kv_offload_load_time_count":          lambda i: 10.0 * i,  # mean=0.05s
+    "vllm:kv_offload_allocation_failure_total": lambda i: 1.0 * i,
 }
 # Deliberately: no bare `sglang_num_retractions` counter, only the histogram parts.
 SGLANG = {
@@ -36,6 +59,8 @@ SGLANG = {
     "sglang_cache_hit_rate":          lambda i: 0.68,
 }
 SERIES = VLLM if ENGINE == "vllm" else SGLANG
+if ENGINE == "vllm" and os.environ.get("FAKE_OFFLOAD") == "1":
+    SERIES = {**SERIES, **VLLM_OFFLOAD}
 
 @app.get("/api/v1/label/__name__/values")
 async def label_values():

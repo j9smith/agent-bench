@@ -8,3 +8,6 @@ README.md
 QUICKSTART.md
 CHEATSHEET.md
 TMUX_CHEATSHEET.md
+results/
+cmds.txt
+look.py

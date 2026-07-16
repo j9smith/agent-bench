@@ -62,6 +62,27 @@ ENGINE_METRICS: dict[str, dict[str, list[str]]] = {
         "_cache_queries":          ["vllm:prefix_cache_queries_total",
                                     "vllm:prefix_cache_queries"],
         "_hit_rate_reported":      ["vllm:gpu_prefix_cache_hit_rate"],  # gone in V1; harmless
+
+        # --- added: per-request token accounting (V1) ---
+        # prompt_tokens_cached = local(GPU) + external(offload) cached tokens served.
+        "cached_tokens_total":     ["vllm:prompt_tokens_cached_total"],
+        # NOTE: histogram logicals (_prefill_recompute, _ttft, _queue_time, _prefill_time,
+        # _decode_time, _offload_load_time) are NOT here -- they're probed via
+        # HISTOGRAM_LOGICALS as _sum/_count pairs. Listing them here too would double-probe
+        # and produce spurious "not found" warnings.
+
+        # --- added: KV OFFLOAD (present only when OffloadingConnector is enabled) ---
+        # Absent when offload is off -> columns come back NaN, which is the signal.
+        # NOTE: external_* (connector/CPU) is DISJOINT from prefix_cache_* (local/GPU).
+        # They are never summed. Conflating them double-counts. Kept as separate cols.
+        "_ext_cache_hits":         ["vllm:external_prefix_cache_hits_total"],
+        "_ext_cache_queries":      ["vllm:external_prefix_cache_queries_total"],
+        "offload_load_bytes":      ["vllm:kv_offload_load_bytes_total",
+                                    "vllm:kv_offload_load_bytes"],
+        "offload_store_bytes":     ["vllm:kv_offload_store_bytes_total",
+                                    "vllm:kv_offload_store_bytes"],
+        "offload_alloc_failures":  ["vllm:kv_offload_allocation_failure_total",
+                                    "vllm:kv_offload_allocation_failure"],
     },
     "sglang": {
         # both prefixes probed: sglang_ (v0.5.4+) and sglang: (older)
@@ -84,7 +105,36 @@ ENGINE_METRICS: dict[str, dict[str, list[str]]] = {
 
 # Cumulative counters: diffed per scrape bucket.
 COUNTER_LOGICALS = {"eviction_events", "prompt_tokens_total", "generation_tokens_total",
-                    "_cache_hits", "_cache_queries"}
+                    "_cache_hits", "_cache_queries",
+                    # added counters:
+                    "cached_tokens_total", "_ext_cache_hits", "_ext_cache_queries",
+                    "offload_load_bytes", "offload_store_bytes", "offload_alloc_failures"}
+
+# Histogram logicals: Prometheus exposes each as <name>_sum + <name>_count (+ _bucket).
+# We reduce to a per-window MEAN = delta(sum)/delta(count), i.e. the average value
+# experienced by requests that completed in that scrape window. That's the right
+# per-request-ish reduction for "queue time a request saw" etc. (Reading a quantile
+# from _bucket is possible but overkill for a blog-post-grade figure; mean is honest
+# and robust.) The probe for these looks for the _sum series; _count is derived by
+# name. A logical here whose _sum is absent -> NaN column, same as any other.
+HISTOGRAM_LOGICALS = {
+    "_prefill_recompute": "vllm:request_prefill_kv_computed_tokens",
+    "_ttft":              "vllm:time_to_first_token_seconds",
+    "_queue_time":        "vllm:request_queue_time_seconds",
+    "_prefill_time":      "vllm:request_prefill_time_seconds",
+    "_decode_time":       "vllm:request_decode_time_seconds",
+    "_offload_load_time": "vllm:kv_offload_load_time",
+}
+
+# logical -> output column name for the reduced histogram mean.
+HISTOGRAM_OUT = {
+    "_prefill_recompute": "prefill_recompute_tokens_mean",
+    "_ttft":              "ttft_server_s_mean",
+    "_queue_time":        "queue_time_s_mean",
+    "_prefill_time":      "prefill_time_s_mean",
+    "_decode_time":       "decode_time_s_mean",
+    "_offload_load_time": "offload_load_time_s_mean",
+}
 
 # The server-side schema is FIXED, not whatever each engine happens to expose. Any
 # column with no backing series is emitted as NaN rather than omitted.
@@ -106,6 +156,25 @@ SERVER_SCHEMA = [
     "generation_tokens_total_delta",
     "prefix_cache_hit_rate",
     "prefix_cache_hit_rate_reported",
+    # --- added: token accounting ---
+    "cached_tokens_total",
+    "cached_tokens_total_delta",
+    "prefill_recompute_tokens_mean",
+    # --- added: latency decomposition (server-side, streaming-independent) ---
+    "ttft_server_s_mean",
+    "queue_time_s_mean",
+    "prefill_time_s_mean",
+    "decode_time_s_mean",
+    # --- added: KV offload (NaN when offload disabled) ---
+    # external_* kept DISJOINT from prefix_cache_* above -- never summed.
+    "external_prefix_cache_hit_rate",
+    "offload_load_bytes",
+    "offload_load_bytes_delta",
+    "offload_store_bytes",
+    "offload_store_bytes_delta",
+    "offload_load_time_s_mean",
+    "offload_alloc_failures",
+    "offload_alloc_failures_delta",
 ]
 
 
@@ -157,9 +226,38 @@ def server_frame(base, engine, start, end, step):
         cols[logical] = pd.Series(
             {float(t): pd.to_numeric(v, errors="coerce") for t, v in values})
 
+    # Histograms: probe <name>_sum and <name>_count separately (only vLLM defines these
+    # logicals; SGLang's map has none). Store both so we can reduce to a per-window mean.
+    hist_present = {}
+    if engine == "vllm":
+        for logical, base_name in HISTOGRAM_LOGICALS.items():
+            s_name, s_vals = probe(base, [base_name + "_sum"], start, end, step)
+            c_name, c_vals = probe(base, [base_name + "_count"], start, end, step)
+            if s_name and c_name:
+                resolved[logical] = base_name + "_{sum,count}"
+                cols[logical + "_sum"] = pd.Series(
+                    {float(t): pd.to_numeric(v, errors="coerce") for t, v in s_vals})
+                cols[logical + "_count"] = pd.Series(
+                    {float(t): pd.to_numeric(v, errors="coerce") for t, v in c_vals})
+                hist_present[logical] = True
+            else:
+                missing.append(logical + " (histogram)")
+
     if missing:
         print(f"[export] {engine}: no series found for {', '.join(missing)} "
-              f"(skipped; check names with `curl <pod>/metrics`)", file=sys.stderr)
+              f"(skipped; NaN columns; check names with `curl <pod>/metrics`)",
+              file=sys.stderr)
+
+    # Offload presence report -- so an intended-offload run that silently ran WITHOUT
+    # the connector is caught immediately, not after you analyse empty columns.
+    if engine == "vllm":
+        off_series = ["offload_load_bytes", "offload_store_bytes", "_ext_cache_hits"]
+        if any(s in resolved for s in off_series):
+            print("[export] KV-offload metrics PRESENT -- offload connector was active.")
+        else:
+            print("[export] KV-offload metrics ABSENT -- offload was off (or this build "
+                  "lacks the connector). Offload columns will be NaN.", file=sys.stderr)
+
     if not cols:
         return pd.DataFrame(), resolved
 
@@ -170,12 +268,27 @@ def server_frame(base, engine, start, end, step):
     for logical in COUNTER_LOGICALS & set(df.columns):
         df[logical + "_delta"] = df[logical].diff()
 
-    # The one column that is genuinely comparable across engines.
+    # Histograms -> per-window mean = delta(sum)/delta(count). NaN where no requests
+    # completed in the window (count didn't advance), which is correct: no sample.
+    for logical in hist_present:
+        s_d = df[logical + "_sum"].diff()
+        c_d = df[logical + "_count"].diff()
+        mean = s_d / c_d.where(c_d > 0)
+        df[HISTOGRAM_OUT[logical]] = mean
+
+    # The one column genuinely comparable across engines: LOCAL prefix-cache hit rate.
     if {"_cache_hits_delta", "_cache_queries_delta"} <= set(df.columns):
         denom = df["_cache_queries_delta"].where(df["_cache_queries_delta"] > 0)
         df["prefix_cache_hit_rate"] = df["_cache_hits_delta"] / denom
     if "_hit_rate_reported" in df.columns:
         df["prefix_cache_hit_rate_reported"] = df["_hit_rate_reported"]
+
+    # EXTERNAL (offload/CPU) hit rate -- computed and reported SEPARATELY from the local
+    # rate above. These are disjoint accounting; summing them double-counts (see the
+    # offload brief). Kept as its own column precisely so nobody adds them together.
+    if {"_ext_cache_hits_delta", "_ext_cache_queries_delta"} <= set(df.columns):
+        edenom = df["_ext_cache_queries_delta"].where(df["_ext_cache_queries_delta"] > 0)
+        df["external_prefix_cache_hit_rate"] = df["_ext_cache_hits_delta"] / edenom
 
     df = df.rename(columns={"eviction_events_delta": "eviction_events_window"})
     df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
@@ -378,7 +491,18 @@ def main() -> int:
     if not args.requests.exists():
         print(f"no request log at {args.requests}", file=sys.stderr)
         return 2
-    rows = [json.loads(l) for l in args.requests.read_text().splitlines() if l.strip()]
+    rows, bad = [], 0
+    for line in args.requests.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            bad += 1  # truncated final line from a killed proxy, etc. skip it.
+    if bad:
+        print(f"[export] skipped {bad} malformed line(s) in {args.requests.name}",
+              file=sys.stderr)
     if not rows:
         print("request log is empty", file=sys.stderr)
         return 2
