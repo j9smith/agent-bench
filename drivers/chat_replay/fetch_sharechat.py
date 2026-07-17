@@ -1,29 +1,15 @@
 """Fetch ShareChat and prepare it for gap-accurate replay.
 
-Why ShareChat over ShareGPT: it carries REAL per-message timestamps for the GPT
-and Grok subsets (message_create_time), so we can replay with the actual human
-inter-turn gaps instead of a fixed/zero delay. That turns chat gap-duration from a
-replay artifact into a measured quantity -- which matters because the whole
-retention argument is about gap observability.
+ShareChat carries REAL per-message timestamps for the GPT and Grok subsets, so we
+replay with actual human inter-turn gaps instead of a fixed/zero delay. That turns
+chat gap-duration from a replay artifact into a measured quantity.
 
-We keep ONLY the timestamped platforms (GPT, Grok = ~90% of turns). The other three
-(Claude, Gemini, Perplexity) have no per-message timing and would reintroduce the
-zero-gap artifact, so they're dropped.
+Only the timestamped platforms (chatgpt, grok) are kept. ShareChat is split into
+PER-PLATFORM configs, not one table -- so we load those two configs and concatenate.
 
-Schema (from the ShareChat release, one row per MESSAGE):
-    platform, url, turns_count, message_index, role, plain_text, detected_language_final
-    GPT/Grok extra: message_create_time (per-message epoch)
-
-Output: data/sharechat.json -- a list of conversations, each:
+Output: data/sharechat.json -- list of conversations, each:
     {"platform","url","turns":[{"role","content","t"}], "gaps":[...]}
-  where gaps[k] = seconds between user-turn k's arrival and the prior assistant
-  reply completing (derived from message_create_time). Replayer sleeps these
-  (capped) between turns.
-
-NOTE: HuggingFace host must be reachable (it is on the pod; it is NOT in the build
-sandbox, so this script is verified against a synthetic fixture, then run for real
-on the pod). If the schema drifted since this was written, the field-name constants
-below are the only thing to adjust.
+where gaps[k] = seconds between user-turn k and the prior message (from timestamps).
 """
 from __future__ import annotations
 
@@ -41,14 +27,12 @@ F_IDX = "message_index"
 F_ROLE = "role"
 F_TEXT = "plain_text"
 F_TS = "message_create_time"          # GPT + Grok per-message timestamp
-KEEP_PLATFORMS = {"GPT", "Grok"}      # the timestamped subset
+KEEP_PLATFORMS = {"GPT", "Grok"}
 ROLE_MAP = {"user": "user", "human": "user", "assistant": "assistant",
             "gpt": "assistant", "bot": "assistant", "model": "assistant"}
 
 
 def _parse_ts(v):
-    """message_create_time may be epoch seconds (float) or ISO string. Return float
-    epoch seconds, or None if unparseable."""
     if v is None:
         return None
     try:
@@ -63,11 +47,6 @@ def _parse_ts(v):
 
 
 def conversations_from_rows(rows) -> list[dict]:
-    """Group message-rows into conversations, keeping timestamped platforms only.
-
-    `rows` is any iterable of dict-like message records (HF dataset rows, or the
-    test fixture). Grouped by url, ordered by message_index.
-    """
     by_url: dict[str, list[dict]] = {}
     for r in rows:
         if r.get(F_PLATFORM) not in KEEP_PLATFORMS:
@@ -91,9 +70,6 @@ def conversations_from_rows(rows) -> list[dict]:
         if sum(1 for t in turns if t["role"] == "user") < 1:
             continue
 
-        # Derive per-user-turn gaps: time between the previous message's timestamp
-        # and this user turn's timestamp. That's the human think/away time the
-        # server can't see. None where timestamps are missing.
         gaps = []
         for i, t in enumerate(turns):
             if t["role"] != "user":
@@ -113,27 +89,48 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=ROOT / "data" / "sharechat.json")
     ap.add_argument("--dataset", default="tucnguyen/ShareChat")
     ap.add_argument("--split", default="train")
+    ap.add_argument("--configs", default="chatgpt,grok",
+                    help="comma list of platform configs to load (timestamped ones only)")
     ap.add_argument("--limit", type=int, default=0,
                     help="max conversations to keep (0 = all)")
     ap.add_argument("--min-turns", type=int, default=2)
     args = ap.parse_args()
 
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset, get_dataset_config_names
     except ImportError:
         print("pip install datasets", file=sys.stderr)
         return 2
 
-    print(f"[sharechat] loading {args.dataset} split={args.split} "
-          f"(GPT+Grok only)...", file=sys.stderr)
-    ds = load_dataset(args.dataset, split=args.split)
-    convs = conversations_from_rows(ds)
+    wanted = [c.strip() for c in args.configs.split(",") if c.strip()]
+    try:
+        available = get_dataset_config_names(args.dataset)
+        wanted = [c for c in wanted if c in available]
+        if not wanted:
+            print(f"[sharechat] none of the requested configs exist. available: "
+                  f"{available}", file=sys.stderr)
+            return 2
+    except Exception:
+        pass
+
+    all_rows = []
+    for cfg in wanted:
+        print(f"[sharechat] loading config '{cfg}'...", file=sys.stderr)
+        d = load_dataset(args.dataset, cfg, split=args.split)
+        plat = {"chatgpt": "GPT", "grok": "Grok"}.get(cfg, cfg)
+        for r in d:
+            row = dict(r)
+            row[F_PLATFORM] = plat
+            all_rows.append(row)
+
+    print(f"[sharechat] {len(all_rows)} message rows across {wanted}; grouping...",
+          file=sys.stderr)
+    convs = conversations_from_rows(all_rows)
     convs = [c for c in convs
              if sum(1 for t in c["turns"] if t["role"] == "user") >= args.min_turns]
     if args.limit > 0:
         convs = convs[:args.limit]
 
-    # quick gap stats so you can pick a sensible --gap-cap at replay time
     all_gaps = [g for c in convs for g in c["gaps"] if g is not None]
     all_gaps.sort()
     def pct(p):
