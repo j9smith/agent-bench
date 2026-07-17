@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # setup_venv.sh - rebuild the agent-bench venv on a fresh pod.
-# A venv is NOT portable across containers (hard-codes interpreter path + libs), so a
-# new pod always needs this even though .venv sits on the persistent volume.
-# Usage:  bash setup_venv.sh
+# A venv is NOT portable across containers, so a new pod needs this even though
+# .venv sits on the persistent volume. Skips rebuild if the existing venv works.
+# Usage:  bash setup_venv.sh   (or  REBUILD=1 bash setup_venv.sh  to force)
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-echo "=== [1/5] (re)creating .venv ==="
+echo "=== [1/5] checking existing venv ==="
+if [[ -x .venv/bin/python ]] && \
+   .venv/bin/python -c "import fastapi, uvicorn, openhands.sdk, litellm, pandas" >/dev/null 2>&1; then
+  echo "  existing .venv works -- skipping rebuild."
+  echo "  (force a rebuild with:  REBUILD=1 bash setup_venv.sh)"
+  if [[ "${REBUILD:-0}" != "1" ]]; then
+    source .venv/bin/activate
+    echo "venv ready. Activate with:  source .venv/bin/activate"
+    exit 0
+  fi
+fi
+
+echo "  rebuilding venv..."
 rm -rf .venv
 python3 -m venv .venv
 source .venv/bin/activate
@@ -15,7 +27,7 @@ pip install --upgrade pip -q
 echo "=== [2/5] core deps (proxy, exporter, drivers) ==="
 pip install -q \
   fastapi "uvicorn[standard]" httpx pandas pyarrow requests orjson \
-  mini-swe-agent datasets PyYAML
+  mini-swe-agent datasets huggingface_hub PyYAML
 
 echo "=== [3/5] OpenHands (no-deps, to dodge the lmnr/opentelemetry conflict) ==="
 pip install -q openhands-sdk openhands-tools --no-deps
@@ -32,7 +44,7 @@ fail=0
 check(){ python -c "$1" >/dev/null 2>&1 && echo "  ok: $2" || { echo "  FAIL: $2"; fail=1; }; }
 check "import fastapi, uvicorn, httpx, pandas, pyarrow" "proxy + exporter"
 check "import minisweagent" "mini-swe-agent"
-check "import datasets" "datasets (SWE-bench + ShareChat)"
+check "import datasets, huggingface_hub" "datasets (SWE-bench + ShareChat)"
 check "import openhands.sdk; from openhands.tools.preset.default import get_default_tools" "openhands"
 check "import litellm" "litellm"
 
