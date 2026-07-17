@@ -208,11 +208,24 @@ cmd_status(){
   tmux has-session -t vllm 2>/dev/null && c_dim "vLLM tmux alive (tmux attach -t vllm)" || true
 }
 
+cmd_arrivals(){
+  local run="${1:-}"; shift || true
+  [[ -z "$run" ]] && { echo "usage: ab arrivals <run-name> [--duration S] [--lambda R] [--mix chat|agent|both] [--abandon-frac F] [--chat-frac F]"; exit 1; }
+  if [[ -e "logs/$run/requests.jsonl" ]]; then
+    c_red "note: logs/$run/ already has data; appending (run_id+session_type tagged)."
+  fi
+  export PROXY_API_KEY="$API_KEY"
+  c_grn "arrivals run '$run' (open-loop Poisson load)"
+  "$PY" -m drivers.arrivals.run_arrivals --run-id "$run" \
+    --model "$MODEL" --proxy-base-url "http://localhost:$PROXY_PORT" "$@"
+}
+
 case "${1:-}" in
   vllm-up) cmd_vllm_up ;; vllm-down) cmd_vllm_down ;;
   up) cmd_up ;; down) cmd_down ;;
   run) shift; cmd_run "$@" ;;
   watch) shift; cmd_watch "$@" ;; watch-kill) cmd_watch_kill ;;
+  arrivals) shift; cmd_arrivals "$@" ;;
   metrics) cmd_metrics ;; show) shift; cmd_show "$@" ;; status) cmd_status ;;
   *) cat <<EOF
 ab - agentic-bench control
@@ -224,6 +237,8 @@ ab - agentic-bench control
   ab run <driver> <name>  agentic | openhands | chat  [-c conc] [-n tasks]
                           [--sweep 8,16,24]  sweep concurrencies (one run per point)
                         openhands also: --delegation --condenser
+  ab arrivals <name> ...  open-loop Poisson load: [--duration S] [--lambda R]
+                          [--mix chat|agent|both] [--abandon-frac F] [--chat-frac F]
   ab watch [run]        live tmux dashboard (metrics + turns + agent stdout)
   ab watch-kill         close dashboard
   ab metrics            one-shot vLLM metrics
