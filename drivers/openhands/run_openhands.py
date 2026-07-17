@@ -204,15 +204,26 @@ def prepare_workspace(inst: dict, root: Path) -> Path:
         subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", "FETCH_HEAD"],
                        check=True, timeout=300)
     except subprocess.CalledProcessError:
-        # Some servers won't let you fetch an arbitrary SHA directly. Fall back to a
-        # shallow clone of the default branch, then check the commit out (still far
-        # smaller than a full clone if the commit is recent-ish).
-        import shutil
+        # Fallback for servers that won't fetch an arbitrary SHA directly. Was
+        # --depth 50 of the default branch, which drags 50 commits of history --
+        # for repos like matplotlib/sphinx that's GBs of test-baseline binaries, and
+        # under continuous arrival load with no cleanup it blew the disk quota.
+        # Now: depth-1 clone (one commit, not 50) with --filter=blob:none so large
+        # blobs come lazily only if touched. Then best-effort checkout of the base
+        # commit; if it isn't reachable at depth 1 we stay on the default-branch tip
+        # (the workspace only needs to be a plausible repo checkout for the agent to
+        # explore -- exact commit fidelity is secondary to not filling the disk).
         shutil.rmtree(wd, ignore_errors=True)
-        subprocess.run(["git", "clone", "--quiet", "--depth", "50", url, str(wd)],
+        subprocess.run(["git", "clone", "--quiet", "--depth", "1",
+                        "--filter=blob:none", url, str(wd)],
                        check=True, timeout=900)
-        subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", commit],
-                       check=True, timeout=300)
+        try:
+            subprocess.run(["git", "-C", str(wd), "fetch", "--quiet", "--depth", "1",
+                            "origin", commit], check=True, timeout=300)
+            subprocess.run(["git", "-C", str(wd), "checkout", "--quiet", "FETCH_HEAD"],
+                           check=True, timeout=120)
+        except subprocess.CalledProcessError:
+            pass  # keep the shallow default-branch checkout
     return wd
 
 
@@ -239,18 +250,28 @@ def run_one(inst: dict, args, logdir: Path) -> dict:
     }
 
     t0 = time.time()
-    with (out / "stdout.log").open("w") as fh:
-        p = subprocess.run([sys.executable, "-c", WORKER, json.dumps(cfg)],
-                           stdout=fh, stderr=subprocess.STDOUT,
-                           timeout=args.task_timeout,
-                           env={**os.environ, "LLM_API_KEY": cfg["api_key"]})
-    rec = {"instance_id": iid, "returncode": p.returncode,
-           "wall_s": round(time.time() - t0, 2)}
     try:
-        rec["counts"] = json.loads((out / "result.json").read_text())["counts"]
-    except Exception:
-        rec["counts"] = None
-    return rec
+        with (out / "stdout.log").open("w") as fh:
+            p = subprocess.run([sys.executable, "-c", WORKER, json.dumps(cfg)],
+                               stdout=fh, stderr=subprocess.STDOUT,
+                               timeout=args.task_timeout,
+                               env={**os.environ, "LLM_API_KEY": cfg["api_key"]})
+        rec = {"instance_id": iid, "returncode": p.returncode,
+               "wall_s": round(time.time() - t0, 2)}
+        try:
+            rec["counts"] = json.loads((out / "result.json").read_text())["counts"]
+        except Exception:
+            rec["counts"] = None
+        return rec
+    finally:
+        # Remove the repo checkout once the agent is done with it. The measurement
+        # data (requests.jsonl, result.json, stdout.log) lives elsewhere and is
+        # untouched -- only the multi-hundred-MB working tree is deleted. This is what
+        # keeps continuous ARRIVAL runs from accumulating checkouts until the disk
+        # fills (the batch path cleaned between sweep points; arrivals had no such
+        # boundary). Opt out with args.keep_workspace = True.
+        if not getattr(args, "keep_workspace", False):
+            shutil.rmtree(wd, ignore_errors=True)
 
 
 def main() -> int:
