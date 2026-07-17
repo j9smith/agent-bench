@@ -226,23 +226,11 @@ def poisson_arrivals(args) -> None:
           "has no steady state. Lower --lambda until concurrency levels off; that "
           "plateau is the operating point you want to measure.", file=sys.stderr)
 
-    while time.time() < stop_at:
-        # exponential inter-arrival wait -> Poisson process
-        wait = rnd.expovariate(args.lam) if args.lam > 0 else 1.0
-        # don't oversleep past the window end
-        if time.time() + wait > stop_at:
-            break
-        time.sleep(wait)
-
-        # pick session type per the mix ratio
-        if args.mix == "both":
-            kind = "chat" if rnd.random() < args.chat_frac else "agent"
-        else:
-            kind = args.mix
+    # -- shared session launcher: used by both prewarm and the Poisson loop --
+    def _launch(kind, sess_id):
         abandon_after = None
         if rnd.random() < args.abandon_frac:
             abandon_after = rnd.randint(args.abandon_min_turns, args.abandon_max_turns)
-
         if kind == "chat" and chat_pool:
             conv = rnd.choice(chat_pool)
             th = threading.Thread(target=_run_chat_session,
@@ -255,10 +243,38 @@ def poisson_arrivals(args) -> None:
                                         registry),
                                   daemon=True)
         else:
-            continue
+            return False
         th.start()
         live.append(th)
         launched[kind] += 1
+        return True
+
+    def _pick_kind():
+        if args.mix == "both":
+            return "chat" if rnd.random() < args.chat_frac else "agent"
+        return args.mix
+
+    # -- PREWARM: launch K sessions immediately so the pool starts near its operating
+    # point, instead of paying a long cold-start ramp before steady state. This makes
+    # the "snapshot of an already-busy server" framing literal. Pick K near the
+    # concurrency lambda will sustain (Little's law: K ~ lambda x mean_session_dur);
+    # too high and concurrency decays from K, too low and it climbs -- either way the
+    # Poisson stream pulls it toward equilibrium, prewarm just removes the long ramp.
+    if args.prewarm > 0:
+        print(f"[arrivals] prewarming {args.prewarm} sessions at t=0...", file=sys.stderr)
+        for _ in range(args.prewarm):
+            _launch(_pick_kind(), sess_id)
+            sess_id += 1
+            time.sleep(args.prewarm_stagger)  # slight stagger avoids a clone thundering-herd
+
+    while time.time() < stop_at:
+        # exponential inter-arrival wait -> Poisson process
+        wait = rnd.expovariate(args.lam) if args.lam > 0 else 1.0
+        # don't oversleep past the window end
+        if time.time() + wait > stop_at:
+            break
+        time.sleep(wait)
+        _launch(_pick_kind(), sess_id)
         sess_id += 1
         # opportunistic reap of finished threads so the list doesn't grow unbounded
         live = [t for t in live if t.is_alive()]
@@ -304,6 +320,11 @@ def main() -> int:
     ap.add_argument("--chat-file", default=str(ROOT / "data" / "sharechat.json"))
     ap.add_argument("--swe-subset", default="lite")
     ap.add_argument("--swe-split", default="test")
+    ap.add_argument("--prewarm", type=int, default=0,
+                    help="launch K sessions at t=0 to start near the operating point "
+                         "(skips cold-start ramp). Pick K ~ expected steady-state concurrency.")
+    ap.add_argument("--prewarm-stagger", type=float, default=0.5,
+                    help="seconds between prewarm launches (avoids a clone thundering herd)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.0)
