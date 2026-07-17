@@ -50,6 +50,39 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 
+class _ProcRegistry:
+    """Thread-safe set of live agent subprocesses, so the orchestrator can hard-kill
+    any still running when the window + drain deadline passes. Without this, agent
+    subprocesses outlive the run and keep hitting the proxy (the orphan bug)."""
+
+    def __init__(self):
+        self._procs = set()
+        self._lock = threading.Lock()
+
+    def add(self, p):
+        with self._lock:
+            self._procs.add(p)
+
+    def remove(self, p):
+        with self._lock:
+            self._procs.discard(p)
+
+    def kill_all(self):
+        with self._lock:
+            procs = list(self._procs)
+        killed = 0
+        for p in procs:
+            if p.poll() is None:  # still running
+                p.terminate()
+                killed += 1
+        # give them a moment, then hard-kill stragglers
+        time.sleep(2)
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+        return killed
+
+
 # ------------------------------------------------------------------ session runners
 # Each returns quickly-ish; they're run in their own threads. They reuse the existing
 # per-session logic rather than reimplementing it.
@@ -112,28 +145,56 @@ def _run_chat_session(sess_id: int, conv: dict, args, stop_at: float,
 
 
 def _run_agent_session(sess_id: int, instance: dict, args, stop_at: float,
-                       abandon_after: int | None) -> None:
-    """One agent session via the OpenHands driver's real run_one(). Agents carry their
-    own endogenous gaps (tool execution) internally, so we don't inject gaps -- the
-    point is that the ARRIVAL of the session is Poisson, not its internal rhythm.
+                       abandon_after: int | None, registry: "_ProcRegistry") -> None:
+    """One agent session, spawned as a KILLABLE subprocess whose handle is registered
+    so the orchestrator can hard-terminate it when the window closes. (Going through
+    run_one's blocking subprocess.run would orphan the agent past the window -- the
+    bug this fixes.) Cleans up the workspace when the agent finishes OR is killed."""
+    import json as _json
+    from drivers.openhands.run_openhands import prepare_workspace, WORKER
 
-    Abandonment isn't cleanly expressible for agents (run_one spawns a subprocess that
-    runs the whole task), so for agents --abandon-frac is a no-op here; abandonment is a
-    chat-side lever. Documented rather than faked."""
-    from types import SimpleNamespace
-    from drivers.openhands.run_openhands import run_one
-
+    iid = instance["instance_id"]
     logdir = ROOT / "logs" / "openhands"
-    logdir.mkdir(parents=True, exist_ok=True)
-    # run_one reads these off `args`; build a shim carrying exactly what it needs.
-    shim = SimpleNamespace(
-        proxy_base_url=args.proxy_base_url, run_id=args.run_id, model=args.model,
-        condenser=False, condenser_max_size=0, delegation=False,
-        task_timeout=args.timeout)
+    out = logdir / iid
+    out.mkdir(parents=True, exist_ok=True)
     try:
-        run_one(instance, shim, logdir)
-    except Exception as exc:  # a failed agent must not kill the arrival loop
-        print(f"[arrivals] agent session {sess_id} error: {exc}", file=sys.stderr)
+        wd = prepare_workspace(instance, logdir / "_workspaces")
+    except Exception as exc:
+        print(f"[arrivals] agent {sess_id} workspace error: {exc}", file=sys.stderr)
+        return
+
+    base = args.proxy_base_url.rstrip("/")
+    cfg = {
+        "task_id": iid, "run_id": args.run_id, "workdir": str(wd),
+        "model": args.model,
+        "api_base": f"{base}/sess/agentic/{iid}/v1",
+        "api_key": os.environ.get("PROXY_API_KEY", "dummy"),
+        "condenser": False, "condenser_max_size": 0, "delegation": False,
+        "task_text": instance["problem_statement"],
+        "result_path": str(out / "result.json"),
+    }
+    proc = None
+    try:
+        with (out / "stdout.log").open("w") as fh:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", WORKER, _json.dumps(cfg)],
+                stdout=fh, stderr=subprocess.STDOUT,
+                env={**os.environ, "LLM_API_KEY": cfg["api_key"]})
+            registry.add(proc)
+            # wait, but not past the hard deadline the orchestrator enforces
+            try:
+                proc.wait(timeout=args.task_timeout)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+    except Exception as exc:
+        print(f"[arrivals] agent {sess_id} error: {exc}", file=sys.stderr)
+    finally:
+        if proc is not None:
+            registry.remove(proc)
+        # workspace removed whether the agent finished, timed out, or was killed at
+        # window close -- the measurement data (requests.jsonl etc) lives elsewhere.
+        import shutil
+        shutil.rmtree(wd, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ arrival loop
@@ -141,6 +202,7 @@ def _run_agent_session(sess_id: int, instance: dict, args, stop_at: float,
 def poisson_arrivals(args) -> None:
     rnd = random.Random(args.seed)
     live: list[threading.Thread] = []
+    registry = _ProcRegistry()
     start = time.time()
     stop_at = start + args.duration
     sess_id = 0
@@ -159,6 +221,10 @@ def poisson_arrivals(args) -> None:
 
     print(f"[arrivals] duration={args.duration}s lambda={args.lam}/s mix={args.mix} "
           f"abandon={args.abandon_frac} run={args.run_id}", file=sys.stderr)
+    print("[arrivals] NOTE: if concurrency climbs for the whole window and never "
+          "plateaus, arrival rate > service rate (rho>1): the system is UNSTABLE and "
+          "has no steady state. Lower --lambda until concurrency levels off; that "
+          "plateau is the operating point you want to measure.", file=sys.stderr)
 
     while time.time() < stop_at:
         # exponential inter-arrival wait -> Poisson process
@@ -185,7 +251,8 @@ def poisson_arrivals(args) -> None:
         elif kind == "agent" and agent_pool:
             inst = rnd.choice(agent_pool)
             th = threading.Thread(target=_run_agent_session,
-                                  args=(sess_id, inst, args, stop_at, abandon_after),
+                                  args=(sess_id, inst, args, stop_at, abandon_after,
+                                        registry),
                                   daemon=True)
         else:
             continue
@@ -197,13 +264,23 @@ def poisson_arrivals(args) -> None:
         live = [t for t in live if t.is_alive()]
 
     elapsed = time.time() - start
+    n_live = sum(t.is_alive() for t in live)
     print(f"[arrivals] window closed at {elapsed:.0f}s. launched: "
           f"chat={launched['chat']} agent={launched['agent']}. "
-          f"draining {sum(t.is_alive() for t in live)} in-flight...", file=sys.stderr)
-    # let in-flight sessions finish their current turn but don't wait forever
+          f"draining up to {args.drain}s ({n_live} in-flight)...", file=sys.stderr)
+    # Let in-flight sessions finish gracefully, but only up to the drain deadline.
     deadline = time.time() + args.drain
     for t in live:
         t.join(timeout=max(0.0, deadline - time.time()))
+
+    # HARD STOP: any agent subprocess still running after the drain deadline is killed,
+    # so `--duration` is a real bound and agents never orphan past the run. Their
+    # workspaces are removed by each session's own finally block on kill.
+    still = sum(1 for t in live if t.is_alive())
+    if still:
+        killed = registry.kill_all()
+        print(f"[arrivals] drain deadline hit: hard-killed {killed} agent "
+              f"subprocess(es) still running.", file=sys.stderr)
     print("[arrivals] done.", file=sys.stderr)
 
 
