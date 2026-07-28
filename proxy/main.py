@@ -29,6 +29,32 @@ Design notes
    the scaffold. Instead the proxy maintains a monotonic per-session counter and
    fills `turn_number` itself when the header is absent. Requests with no
    session header at all are logged with nulls and are never failed.
+
+4. KV retention hints (optional; OFF unless asked for). The proxy is the only
+   component that sees both the harness's notion of a trajectory AND vLLM's
+   `request_id` (the `id` field of every completion response), so it is where a
+   client-side retention hint has to be assembled.
+
+   Both hints POST to the upstream `/kv_hint` endpoint, which only exists on a
+   hint-enabled vLLM build. A 404 is logged and otherwise ignored, so pointing
+   this proxy at stock vLLM changes nothing.
+
+   dontneed  POST /_hint/session_done {"task_id": ...} when a trajectory ends.
+             The client knows this exactly -- no estimate, no threshold. LRU
+             does the opposite of the right thing here: freed blocks land at the
+             most-recently-used end of the queue, so a FINISHED trajectory's
+             context becomes the most protected material in the pool, while a
+             live sequence paused mid-tool-call ages toward eviction.
+
+   willneed/pageout  Needs a predicted gap, so it is only as good as its
+             predictor. The predictor here is a per-tool EWMA of the OBSERVED
+             dispatch gap: the proxy reads the tool name from each response and,
+             when the next request on that sequence arrives, attributes the
+             measured gap to it. Self-calibrating, needs no model introspection,
+             and measures the gap the serving layer actually experiences rather
+             than tool execution time. Enabled per-request via the header
+             `X-KV-Hint-Gap: 1`, so arms switch without restarting the proxy.
+             UNTESTED as of writing -- run the dontneed arm first.
 """
 
 from __future__ import annotations
@@ -39,7 +65,7 @@ import json
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -51,6 +77,17 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 UPSTREAM_BASE_URL = os.environ.get("UPSTREAM_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 INJECT_USAGE = os.environ.get("PROXY_INJECT_USAGE", "1") not in ("0", "false", "False")
 REQUEST_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT_S", "1800"))
+
+# --- KV hint knobs. All inert unless a hint is actually requested. ---
+# Bound on the (task, sequence) -> last upstream request id map. Entries only
+# need to outlive one trajectory.
+KV_HINT_CAP = int(os.environ.get("PROXY_KV_HINT_CAP", "4096"))
+# Gap-hint predictor: EWMA smoothing, and how many observations a tool needs
+# before its EWMA is trusted enough to hint on. Below that we stay silent
+# rather than send a made-up number.
+KV_GAP_ALPHA = float(os.environ.get("PROXY_KV_GAP_ALPHA", "0.2"))
+KV_GAP_MIN_SAMPLES = int(os.environ.get("PROXY_KV_GAP_MIN_SAMPLES", "5"))
+
 
 # Hop-by-hop headers we must not forward.
 _DROP_REQUEST_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
@@ -100,6 +137,138 @@ class RunRouter:
                 pass
 
 
+class KVHintState:
+    """Everything the hint paths need, in one lock.
+
+    Two maps:
+
+    _last  (task_id, sequence_id) -> most recent upstream request id. Only the
+           LAST request of a sequence matters for dontneed: its block chain is a
+           superset of every earlier request's in that sequence, because context
+           only grows. One POST per sequence, not per turn.
+
+    _gap   tool name -> EWMA of observed dispatch gap in ms, plus a sample
+           count. Populated by observe_gap() when the next request of a sequence
+           arrives, so the predictor is trained on exactly the quantity it
+           predicts. No model introspection involved.
+
+    _pending  (task, sequence) -> (tool name, ts_last_byte) of the response we
+           are waiting to see a gap for.
+    """
+
+    def __init__(self, cap: int):
+        self._cap = cap
+        self._last: OrderedDict[tuple, str] = OrderedDict()
+        self._pending: OrderedDict[tuple, tuple] = OrderedDict()
+        self._gap: dict[str, list] = {}   # tool -> [ewma_ms, n]
+        self._lock = asyncio.Lock()
+        self.stats = defaultdict(int)
+
+    @staticmethod
+    def _trim(d: OrderedDict, cap: int) -> None:
+        while len(d) > cap:
+            d.popitem(last=False)
+
+    async def note_response(self, task_id, sequence_id, req_id, tool, ts_last_byte):
+        """Record a completed response: its upstream id, and which tool it asked
+        for (so the next request's gap can be attributed)."""
+        if not task_id:
+            return
+        key = (task_id, sequence_id)
+        async with self._lock:
+            if req_id:
+                self._last[key] = req_id
+                self._last.move_to_end(key)
+                self._trim(self._last, self._cap)
+            if tool and ts_last_byte:
+                self._pending[key] = (tool, ts_last_byte)
+                self._pending.move_to_end(key)
+                self._trim(self._pending, self._cap)
+
+    async def observe_gap(self, task_id, sequence_id, ts_request_in) -> None:
+        """Close the loop: this request's arrival minus the previous response's
+        last byte IS the dispatch gap, attributed to the tool that caused it."""
+        key = (task_id, sequence_id)
+        async with self._lock:
+            prev = self._pending.pop(key, None)
+            if not prev or not ts_request_in:
+                return
+            tool, ts_prev = prev
+            gap_ms = (ts_request_in - ts_prev) * 1000.0
+            if gap_ms <= 0:
+                return
+            slot = self._gap.get(tool)
+            if slot is None:
+                self._gap[tool] = [gap_ms, 1]
+            else:
+                slot[0] = KV_GAP_ALPHA * gap_ms + (1 - KV_GAP_ALPHA) * slot[0]
+                slot[1] += 1
+
+    async def predict_gap_ms(self, tool: str | None) -> float | None:
+        """EWMA for this tool, or None until it has enough samples."""
+        if not tool:
+            return None
+        async with self._lock:
+            slot = self._gap.get(tool)
+            if not slot or slot[1] < KV_GAP_MIN_SAMPLES:
+                return None
+            return slot[0]
+
+    async def pop_task(self, task_id) -> list[str]:
+        """Take every known request id for a task and forget them."""
+        async with self._lock:
+            keys = [k for k in self._last if k[0] == task_id]
+            out = [self._last.pop(k) for k in keys]
+            for k in keys:
+                self._pending.pop(k, None)
+            return out
+
+    async def snapshot(self) -> dict:
+        async with self._lock:
+            return {
+                "tracked_sequences": len(self._last),
+                "tools_learned": {t: {"ewma_gap_ms": round(v[0], 1), "n": v[1]}
+                                  for t, v in sorted(self._gap.items())},
+                **{k: v for k, v in sorted(self.stats.items())},
+            }
+
+
+async def _post_kv_hint(client: httpx.AsyncClient, payload: dict, stats) -> dict:
+    """Fire one hint upstream. Never raises: a hint is advisory by construction,
+    and a proxy that 500s because the serving build lacks /kv_hint would be
+    strictly worse than one that logs and carries on."""
+    try:
+        r = await client.post("/kv_hint", json=payload, timeout=10.0)
+    except Exception as exc:
+        stats["hint_post_errors"] += 1
+        return {"error": repr(exc)}
+    if r.status_code == 404:
+        stats["hint_post_404"] += 1
+        return {"status": 404, "note": "upstream has no /kv_hint (stock vLLM)"}
+    stats["hint_post_ok" if r.status_code < 400 else "hint_post_failed"] += 1
+    return {"status": r.status_code, "body": r.text[:200]}
+
+
+def _first_tool_name(payload: dict | None) -> str | None:
+    """Tool name from a completion response, if it called one.
+
+    This is the whole hint source: available to the proxy for free, before the
+    tool has run, and invisible to the serving layer.
+    """
+    if not payload:
+        return None
+    try:
+        for ch in payload.get("choices") or []:
+            msg = ch.get("message") or ch.get("delta") or {}
+            for tc in msg.get("tool_calls") or []:
+                fn = (tc.get("function") or {}).get("name")
+                if fn:
+                    return fn
+    except Exception:
+        pass
+    return None
+
+
 class TurnCounter:
     def __init__(self) -> None:
         self._counts: dict[str, int] = defaultdict(int)
@@ -120,6 +289,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.log = RunRouter(LOG_DIR)
     app.state.turns = TurnCounter()
+    app.state.hints = KVHintState(KV_HINT_CAP)
     print(f"[proxy] upstream={UPSTREAM_BASE_URL} log_dir={LOG_DIR} inject_usage={INJECT_USAGE}")
     yield
     await app.state.client.aclose()
@@ -230,6 +400,48 @@ async def healthz() -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
+# NOTE ON ROUTE ORDER: these must be declared BEFORE the /{path:path} catch-all
+# below, or FastAPI matches the catch-all first and forwards them upstream.
+@app.post("/_hint/session_done")
+async def hint_session_done(request: Request):
+    """The trajectory is over: its KV is a corpse.
+
+    Zero estimation error -- the client knows this as a fact, and the serving
+    layer has no channel to learn it. Called by the driver after
+    conversation.run() returns, success or failure: a failed trajectory's blocks
+    are just as dead.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body must be json"}, status_code=400)
+    task_id = body.get("task_id")
+    if not task_id:
+        return JSONResponse({"error": "task_id required"}, status_code=400)
+
+    hints: KVHintState = app.state.hints
+    req_ids = await hints.pop_task(task_id)
+    if not req_ids:
+        hints.stats["done_no_known_requests"] += 1
+        return JSONResponse({"task_id": task_id, "applied": 0,
+                             "reason": "no_known_requests"})
+
+    hints.stats["done_hints_sent"] += len(req_ids)
+    results = [await _post_kv_hint(app.state.client,
+                                   {"request_id": rid, "done": True}, hints.stats)
+               for rid in req_ids]
+    return JSONResponse({"task_id": task_id, "sequences": len(req_ids),
+                         "results": results})
+
+
+@app.get("/_hint/stats")
+async def hint_stats():
+    """Proxy-side view: what the proxy tried to send, and what its gap predictor
+    has learned. Distinct from vLLM's /kv_hint/stats, which reports what the
+    server did with them."""
+    return JSONResponse(await app.state.hints.snapshot())
+
+
 def _strip_session_path(path: str) -> tuple[str, str | None, str | None]:
     """Support `/sess/{session_type}/{session_id}/v1/chat/completions`.
 
@@ -321,9 +533,17 @@ async def proxy(path: str, request: Request):
         **h,
     }
 
+    # Close the predictor's loop before dispatching: this request arriving IS the
+    # end of the previous turn's gap. Cheap, and unconditional so the EWMA keeps
+    # learning even in arms that emit no hints -- which means a later gap-hint arm
+    # starts warm rather than spending its first minutes silent.
+    await app.state.hints.observe_gap(task_id, sequence_id, time.time())
+    gap_hint = request.headers.get("X-KV-Hint-Gap") in ("1", "true", "True")
+
     if record["stream"]:
-        return await _handle_stream(client, path, raw, body, fwd_headers, record)
-    return await _handle_unary(client, path, raw, fwd_headers, record)
+        return await _handle_stream(client, path, raw, body, fwd_headers, record,
+                                    gap_hint)
+    return await _handle_unary(client, path, raw, fwd_headers, record, gap_hint)
 
 
 def _plain_response(upstream: httpx.Response):
@@ -338,7 +558,7 @@ def _plain_response(upstream: httpx.Response):
     )
 
 
-async def _handle_unary(client, path, raw, headers, record):
+async def _handle_unary(client, path, raw, headers, record, gap_hint=False):
     t0 = time.time()
     try:
         upstream = await client.post("/" + path, content=raw, headers=headers)
@@ -352,11 +572,14 @@ async def _handle_unary(client, path, raw, headers, record):
                             status_code=502)
 
     t_end = time.time()
-    usage: dict[str, Any] = {}
+    payload: dict[str, Any] | None = None
     try:
-        usage = (upstream.json() or {}).get("usage") or {}
+        payload = upstream.json()
     except Exception:
         pass
+    usage = (payload or {}).get("usage") or {}
+    resp_id = (payload or {}).get("id")
+    tool = _first_tool_name(payload)
 
     record.update(
         ts_request_in=t0,
@@ -369,12 +592,40 @@ async def _handle_unary(client, path, raw, headers, record):
         usage_source="response" if usage else None,
         stream_chunks=None,
         error=None,
+        response_id=resp_id,
+        tool_called=tool,
     )
+    await app.state.hints.note_response(record.get("task_id"),
+                                        record.get("sequence_id"),
+                                        resp_id, tool, t_end)
+    await _maybe_gap_hint(gap_hint, resp_id, tool)
     await app.state.log.write(record)
     return _plain_response(upstream)
 
 
-async def _handle_stream(client, path, raw, body, headers, record):
+async def _maybe_gap_hint(enabled: bool, resp_id: str | None, tool: str | None):
+    """Send expect_return_ms for the gap this tool call is about to open.
+
+    Fires only when the header asked for it AND the predictor has enough samples
+    for this tool. The wire carries a DURATION, not a decision -- the server maps
+    it onto retain/offload against its own thresholds, so those can be swept
+    without re-running any agents.
+    """
+    if not enabled or not resp_id or not tool:
+        return
+    hints: KVHintState = app.state.hints
+    predicted = await hints.predict_gap_ms(tool)
+    if predicted is None:
+        hints.stats["gap_hint_skipped_cold"] += 1
+        return
+    hints.stats["gap_hints_sent"] += 1
+    await _post_kv_hint(app.state.client,
+                        {"request_id": resp_id,
+                         "expect_return_ms": round(predicted, 1)},
+                        hints.stats)
+
+
+async def _handle_stream(client, path, raw, body, headers, record, gap_hint=False):
     client_wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
     send_raw = raw
     if INJECT_USAGE and not client_wants_usage:
@@ -387,7 +638,8 @@ async def _handle_stream(client, path, raw, body, headers, record):
     log = app.state.log
     t0 = time.time()
     state: dict[str, Any] = {"first_byte": None, "chunks": 0, "usage": None,
-                             "status": None, "error": None}
+                             "status": None, "error": None,
+                             "resp_id": None, "tool": None}
 
     async def body_iter():
         buf = b""
@@ -417,6 +669,13 @@ async def _handle_stream(client, path, raw, body, headers, record):
                         obj = _parse_sse_event(event)
                         if obj is not None and obj.get("usage"):
                             state["usage"] = obj["usage"]
+                        if obj is not None:
+                            # Read-only inspection; the event is re-emitted below
+                            # byte-for-byte regardless.
+                            if state["resp_id"] is None:
+                                state["resp_id"] = obj.get("id")
+                            if state["tool"] is None:
+                                state["tool"] = _first_tool_name(obj)
                         if suppress_usage_chunk and _is_usage_only_chunk(obj):
                             continue  # injected on the client's behalf; don't leak it
                         state["chunks"] += 1
@@ -427,10 +686,11 @@ async def _handle_stream(client, path, raw, body, headers, record):
             state["error"] = repr(exc)
         finally:
             usage = state["usage"] or {}
+            t_end = time.time()
             record.update(
                 ts_request_in=t0,
                 ts_first_byte=state["first_byte"],
-                ts_last_byte=time.time(),
+                ts_last_byte=t_end,
                 status_code=state["status"],
                 prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens"),
@@ -439,7 +699,14 @@ async def _handle_stream(client, path, raw, body, headers, record):
                               else "stream_client" if usage else None),
                 stream_chunks=state["chunks"],
                 error=state["error"],
+                response_id=state["resp_id"],
+                tool_called=state["tool"],
             )
+            await app.state.hints.note_response(record.get("task_id"),
+                                                record.get("sequence_id"),
+                                                state["resp_id"], state["tool"],
+                                                t_end)
+            await _maybe_gap_hint(gap_hint, state["resp_id"], state["tool"])
             await log.write(record)
 
     return StreamingResponse(

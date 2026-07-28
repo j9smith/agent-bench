@@ -187,6 +187,33 @@ cmd_metrics(){
   curl -s "localhost:$VLLM_PORT/metrics" | grep -vE "^#" | grep -E \
     "num_requests_running|num_requests_waiting|kv_cache_usage|prefix_cache_(queries|hits)_total|num_preemptions_total|gpu_cache_usage" \
     || c_red "vLLM not reachable on :$VLLM_PORT"
+  # KV hint counters. Two sources, deliberately: vLLM says what it DID with the
+  # hints, the proxy says what it TRIED to send. A gap between them is the bug you
+  # want to see. Both silently absent on stock vLLM / hints-off runs. Printed one
+  # key per line to match the Prometheus text shape above, so START/END snapshots
+  # in _bounds.log diff cleanly.
+  local hs
+  hs=$(curl -s --max-time 5 "localhost:$VLLM_PORT/kv_hint/stats" 2>/dev/null || true)
+  if [[ -n "$hs" && "${hs:0:1}" == "{" ]]; then
+    echo "$hs" | "$PY" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k, v in sorted(d.items()):
+    print(f"kv_hint:{k} {v}")' 2>/dev/null || true
+  fi
+  local ps
+  ps=$(curl -s --max-time 5 "localhost:$PROXY_PORT/_hint/stats" 2>/dev/null || true)
+  if [[ -n "$ps" && "${ps:0:1}" == "{" ]]; then
+    echo "$ps" | "$PY" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k, v in sorted(d.items()):
+    print(f"proxy_hint:{k} {json.dumps(v) if isinstance(v, dict) else v}")' 2>/dev/null || true
+  fi
 }
 cmd_show(){
   local run="${1:-}"; [[ -z "$run" ]] && { echo "usage: ab show <run-name>"; exit 1; }
@@ -195,7 +222,9 @@ cmd_show(){
   "$PY" ab_helpers/show_run.py "$log"
   c_dim "exporting joined table..."
   "$PY" scripts/export_metrics.py --engine auto --requests "$log" \
-    --prometheus "http://localhost:$PROM_PORT" --step "$SCRAPE_INTERVAL" --out "analysis/results_$run" \
+    --prometheus "http://localhost:$PROM_PORT" --step "$SCRAPE_INTERVAL" \
+    --kv-hint-url "http://localhost:$VLLM_PORT" \
+    --proxy-hint-url "http://localhost:$PROXY_PORT" --out "analysis/results_$run" \
     || c_red "export failed (prometheus up? 'ab up'). raw log still at $log."
 }
 cmd_status(){
@@ -236,7 +265,9 @@ ab - agentic-bench control
   ab down               stop proxy + prometheus
   ab run <driver> <name>  agentic | openhands | chat  [-c conc] [-n tasks]
                           [--sweep 8,16,24]  sweep concurrencies (one run per point)
-                        openhands also: --delegation --condenser
+                        openhands also: --delegation [--max-fanout N] --condenser
+                                        --estimate-durations --feedback-durations
+                                        --kv-hint-done --kv-hint-gap
   ab arrivals <name> ...  open-loop Poisson load: [--duration S] [--lambda R]
                           [--mix chat|agent|both] [--abandon-frac F] [--chat-frac F]
   ab watch [run]        live tmux dashboard (metrics + turns + agent stdout)

@@ -476,6 +476,70 @@ def dump_raw_series(base, engine, start, end, step, out: Path) -> int:
     return len(names)
 
 
+def fetch_hint_stats(base: str | None, path: str, label: str) -> dict | None:
+    """Read a KV-hint stats endpoint.
+
+    These are RUN-LEVEL SCALARS, not a time series -- nothing polls them, so there is
+    no per-scrape value to join onto individual requests. They go in the manifest and
+    the printed summary instead of the joined table, which keeps the table's schema
+    identical between hinted and unhinted arms.
+
+    Two sources, and the difference between them is diagnostic: vLLM's
+    /kv_hint/stats says what the server DID with the hints, the proxy's /_hint/stats
+    says what it TRIED to send. Hints sent but not applied means they arrived after
+    the blocks had already gone.
+    """
+    if not base:
+        return None
+    url = f"{base.rstrip('/')}{path}"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 404:
+            print(f"[export] {label}: 404 at {url} -- endpoint absent "
+                  f"(stock vLLM, or hints were never enabled).", file=sys.stderr)
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        print(f"[export] {label}: unavailable ({exc})", file=sys.stderr)
+        return None
+
+
+def report_hint_stats(server: dict | None, proxy: dict | None) -> None:
+    """Print the hint counters, and call out the two states that look like success.
+
+    An arm where nothing was applied, or where corpses were marked but never
+    reclaimed, produced NO SIGNAL -- it is not a null result, and averaging it in
+    with real points would quietly dilute them.
+    """
+    if proxy:
+        print("[export] proxy hint activity (what the client tried to send):")
+        for k, v in sorted(proxy.items()):
+            print(f"           {k:<28} {json.dumps(v) if isinstance(v, dict) else v}")
+    if not server:
+        return
+    print("[export] server hint stats (what vLLM did with them):")
+    for k, v in sorted(server.items()):
+        print(f"           {k:<28} {v}")
+
+    dontneed = server.get("blocks_dontneed") or 0
+    stolen = server.get("blocks_stolen_dead") or 0
+    resurrected = server.get("blocks_dead_resurrected") or 0
+    if not dontneed:
+        print("[export] NOTE: blocks_dontneed == 0 -- no dontneed hint was ever "
+              "applied. Either the run had --kv-hint-done off, or every POST landed "
+              "after the blocks had already been evicted.", file=sys.stderr)
+    elif not stolen:
+        print("[export] NOTE: blocks_dontneed > 0 but blocks_stolen_dead == 0 -- "
+              "corpses were marked but never reclaimed under pressure, so this arm "
+              "produced no signal. Run above the eviction knee.", file=sys.stderr)
+    if resurrected:
+        print(f"[export] NOTE: blocks_dead_resurrected == {resurrected} -- blocks "
+              "marked dead were wanted again. The completion signal fired too early; "
+              "something is still touching the conversation after run() returned.",
+              file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", choices=["vllm", "sglang", "auto"], default="auto")
@@ -486,6 +550,10 @@ def main() -> int:
     ap.add_argument("--no-prometheus", action="store_true")
     ap.add_argument("--no-raw", action="store_true",
                     help="skip the raw series archive (you probably don't want this)")
+    ap.add_argument("--kv-hint-url", default=None,
+                    help="vLLM base url to read /kv_hint/stats from (hint builds only)")
+    ap.add_argument("--proxy-hint-url", default=None,
+                    help="proxy base url to read /_hint/stats from")
     args = ap.parse_args()
 
     if not args.requests.exists():
@@ -528,6 +596,14 @@ def main() -> int:
     engine = args.engine
     resolved: dict = {}
     n_raw = 0
+
+    # Read BEFORE the Prometheus work: these counters are cumulative for the life of
+    # the server process, so the sooner after the run they are read the less any
+    # subsequent activity contaminates them.
+    hint_server = fetch_hint_stats(args.kv_hint_url, "/kv_hint/stats", "kv_hint stats")
+    hint_proxy = fetch_hint_stats(args.proxy_hint_url, "/_hint/stats", "proxy hint stats")
+    report_hint_stats(hint_server, hint_proxy)
+
     if not args.no_prometheus:
         start = float(req["ts_request_in"].min()) - args.step * 2
         end = float(req["ts_last_byte"].max()) + args.step * 2
@@ -607,6 +683,11 @@ def main() -> int:
         "resolved_series": resolved,
         "n_raw_series_archived": n_raw,
         "server_schema": SERVER_SCHEMA,
+        # Run-level, not per-request: see fetch_hint_stats. null when the endpoints
+        # were absent or not asked for, which is itself the record that this arm ran
+        # without hints.
+        "kv_hint_stats": hint_server,
+        "proxy_hint_stats": hint_proxy,
     }
     (out.parent / f"manifest_{engine}.json").write_text(json.dumps(manifest, indent=2))
 

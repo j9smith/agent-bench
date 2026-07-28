@@ -70,6 +70,18 @@ from openhands.sdk.event.condenser import Condensation
 cfg = json.loads(sys.argv[1])
 task_id, workdir = cfg["task_id"], cfg["workdir"]
 
+# Per-run opt-in for proxy-side gap hinting. Sent as a header so an arm switches
+# without restarting the long-lived proxy. The proxy is what actually predicts and
+# emits; the worker only declares that this run wants it.
+_extra_headers = {
+    "X-Task-Id": task_id,
+    "X-Session-Id": task_id,
+    "X-Session-Type": "agentic",
+    "X-Run-Id": cfg["run_id"],
+}
+if cfg.get("kv_hint_gap"):
+    _extra_headers["X-KV-Hint-Gap"] = "1"
+
 llm = LLM(
     usage_id="agent",
     model=f"hosted_vllm/{cfg['model']}",
@@ -77,12 +89,7 @@ llm = LLM(
     api_key=cfg["api_key"],
     # Static for the process -- which is exactly why task_id lives here and
     # sequence_id is derived by the proxy from the conversation root instead.
-    extra_headers={
-        "X-Task-Id": task_id,
-        "X-Session-Id": task_id,
-        "X-Session-Type": "agentic",
-        "X-Run-Id": cfg["run_id"],
-    },
+    extra_headers=_extra_headers,
 )
 
 ADD_EST = bool(cfg.get("estimate_durations"))
@@ -169,8 +176,8 @@ def _with_estimate(action_type):
             target,
             (action_type,),
             {
-                _EST_FIELD: _PField(default=None, description=_EST_DESC),
-                "__annotations__": {_EST_FIELD: int | None},
+                _EST_FIELD: _PField(description=_EST_DESC),
+                "__annotations__": {_EST_FIELD: int},
             },
         )
         _est_cache[action_type] = made
@@ -557,6 +564,31 @@ def on_event(event):
     # with existing result.json consumers; it is an event count.
     counts["llm_messages"] += 1
 
+def _kv_hint_done():
+    """Tell the proxy this trajectory is over, so it can mark the KV dead.
+
+    The proxy holds the mapping to vLLM's request_id (which the worker never sees)
+    and does the actual POST to /kv_hint. Best-effort by design: a hint is
+    advisory, so a failure here must never affect the measured run.
+    """
+    if not cfg.get("kv_hint_done"):
+        return
+    import urllib.error
+    import urllib.request
+
+    url = cfg["proxy_base"].rstrip("/") + "/_hint/session_done"
+    data = json.dumps({"task_id": task_id, "run_id": cfg["run_id"]}).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print("[worker] kv_hint done -> %s" % resp.read().decode()[:300],
+                  file=sys.stderr, flush=True)
+    except Exception as exc:
+        print("[worker] kv_hint done POST failed: %r" % exc,
+              file=sys.stderr, flush=True)
+
+
 result = {"task_id": task_id, "exit": "ok"}
 try:
     conversation = Conversation(agent=agent, workspace=workdir, callbacks=[on_event])
@@ -564,6 +596,10 @@ try:
     conversation.run()
 except Exception as exc:
     result.update(exit="error", error=repr(exc), traceback=traceback.format_exc())
+finally:
+    # finally, not else: a FAILED trajectory's blocks are corpses too, and leaving
+    # them protected is exactly the inversion this hint exists to correct.
+    _kv_hint_done()
 
 result["counts"] = counts
 Path(cfg["result_path"]).write_text(json.dumps(result, indent=2))
@@ -693,6 +729,11 @@ def run_one(inst: dict, args, logdir: Path) -> dict:
         "max_fanout": args.max_fanout,
         "estimate_durations": args.estimate_durations,
         "feedback_durations": args.feedback_durations,
+        # Proxy base WITHOUT the /sess/... suffix: the hint endpoint is proxy-level,
+        # not per-session.
+        "proxy_base": base,
+        "kv_hint_done": args.kv_hint_done,
+        "kv_hint_gap": args.kv_hint_gap,
         "task_text": inst["problem_statement"],
         "result_path": str(out / "result.json"),
         "timings_path": str(out / "timings.jsonl"),
@@ -758,6 +799,18 @@ def main() -> int:
                     help="enable LLMSummarizingCondenser (the SDK default; off here)")
     ap.add_argument("--condenser-max-size", type=int, default=80,
                     help="events before condensation fires")
+
+    # KV retention hints. Both need a hint-enabled vLLM build; against stock vLLM
+    # the proxy's POST 404s, is counted, and changes nothing about the run.
+    ap.add_argument("--kv-hint-done", action="store_true",
+                    help="POST a dontneed hint when each trajectory finishes. Zero "
+                         "estimation error: the client knows this as a fact. Fixes "
+                         "LRU's inversion, where a finished trajectory's freed "
+                         "blocks become the MOST protected in the pool.")
+    ap.add_argument("--kv-hint-gap", action="store_true",
+                    help="ask the proxy to send expect_return_ms before each tool "
+                         "call, predicted from its own per-tool EWMA of observed "
+                         "dispatch gaps. UNTESTED; run --kv-hint-done first.")
     args = ap.parse_args()
 
     try:
@@ -785,6 +838,10 @@ def main() -> int:
     print(f"[openhands] {len(insts)} tasks, concurrency={args.concurrency}, "
           f"delegation={'ON' if args.delegation else 'off'}, "
           f"condenser={'ON' if args.condenser else 'off'}, model={args.model}")
+    if args.kv_hint_done or args.kv_hint_gap:
+        print(f"[openhands] kv hints: done={'ON' if args.kv_hint_done else 'off'} "
+              f"gap={'ON' if args.kv_hint_gap else 'off'} "
+              f"(via proxy {args.proxy_base_url})")
 
     q: queue.Queue = queue.Queue()
     for i in insts:
@@ -825,6 +882,8 @@ def main() -> int:
          "condenser": args.condenser,
          "estimate_durations": args.estimate_durations,
          "feedback_durations": args.feedback_durations,
+         "kv_hint_done": args.kv_hint_done,
+         "kv_hint_gap": args.kv_hint_gap,
          "concurrency": args.concurrency, "results": results}, indent=2))
 
     def total(key):
