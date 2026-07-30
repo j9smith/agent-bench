@@ -97,6 +97,7 @@ _DROP_RESPONSE_HEADERS = {"content-length", "content-encoding", "transfer-encodi
 LOG_DIR = Path(os.environ.get("PROXY_LOG_DIR", "logs"))
 DEFAULT_RUN = os.environ.get("PROXY_DEFAULT_RUN", "default")
 
+KV_GAP_MAX_S = float(os.environ.get("PROXY_KV_GAP_MAX_S", "300"))
 
 class RunRouter:
     """Routes each request to logs/<run_id>/requests.jsonl, opening files on demand.
@@ -169,12 +170,10 @@ class KVHintState:
         while len(d) > cap:
             d.popitem(last=False)
 
-    async def note_response(self, task_id, sequence_id, req_id, tool, ts_last_byte):
-        """Record a completed response: its upstream id, and which tool it asked
-        for (so the next request's gap can be attributed)."""
+    async def note_response(self, run_id, task_id, sequence_id, req_id, tool, ts_last_byte):
         if not task_id:
             return
-        key = (task_id, sequence_id)
+        key = (run_id, task_id, sequence_id)
         async with self._lock:
             if req_id:
                 self._last[key] = req_id
@@ -185,17 +184,19 @@ class KVHintState:
                 self._pending.move_to_end(key)
                 self._trim(self._pending, self._cap)
 
-    async def observe_gap(self, task_id, sequence_id, ts_request_in) -> None:
-        """Close the loop: this request's arrival minus the previous response's
-        last byte IS the dispatch gap, attributed to the tool that caused it."""
-        key = (task_id, sequence_id)
+    async def observe_gap(self, run_id, task_id, sequence_id, ts_request_in) -> None:
+        key = (run_id, task_id, sequence_id)
         async with self._lock:
             prev = self._pending.pop(key, None)
             if not prev or not ts_request_in:
                 return
             tool, ts_prev = prev
             gap_ms = (ts_request_in - ts_prev) * 1000.0
-            if gap_ms <= 0:
+            # TTL: a "gap" longer than any real tool call is a stale entry
+            # (retry, crash, or a keying escape), not training data.
+            if gap_ms <= 0 or gap_ms > KV_GAP_MAX_S * 1000.0:
+                if gap_ms > KV_GAP_MAX_S * 1000.0:
+                    self.stats["gap_discarded_stale"] += 1
                 return
             slot = self._gap.get(tool)
             if slot is None:
@@ -214,14 +215,13 @@ class KVHintState:
                 return None
             return slot[0]
 
-    async def pop_task(self, task_id) -> list[str]:
-        """Take every known request id for a task and forget them."""
-        async with self._lock:
-            keys = [k for k in self._last if k[0] == task_id]
-            out = [self._last.pop(k) for k in keys]
-            for k in keys:
-                self._pending.pop(k, None)
-            return out
+    async def pop_task(self, run_id, task_id) -> list[str]:
+            async with self._lock:
+                keys = [k for k in self._last if k[0] == run_id and k[1] == task_id]
+                out = [self._last.pop(k) for k in keys]
+                for k in keys:
+                    self._pending.pop(k, None)
+                return out
 
     async def snapshot(self) -> dict:
         async with self._lock:
@@ -418,9 +418,9 @@ async def hint_session_done(request: Request):
     task_id = body.get("task_id")
     if not task_id:
         return JSONResponse({"error": "task_id required"}, status_code=400)
-
+    run_id = body.get("run_id")
     hints: KVHintState = app.state.hints
-    req_ids = await hints.pop_task(task_id)
+    req_ids = await hints.pop_task(run_id, task_id)
     if not req_ids:
         hints.stats["done_no_known_requests"] += 1
         return JSONResponse({"task_id": task_id, "applied": 0,
@@ -537,7 +537,7 @@ async def proxy(path: str, request: Request):
     # end of the previous turn's gap. Cheap, and unconditional so the EWMA keeps
     # learning even in arms that emit no hints -- which means a later gap-hint arm
     # starts warm rather than spending its first minutes silent.
-    await app.state.hints.observe_gap(task_id, sequence_id, time.time())
+    await app.state.hints.observe_gap(run_id, task_id, sequence_id, time.time())
     gap_hint = request.headers.get("X-KV-Hint-Gap") in ("1", "true", "True")
 
     if record["stream"]:
@@ -595,7 +595,8 @@ async def _handle_unary(client, path, raw, headers, record, gap_hint=False):
         response_id=resp_id,
         tool_called=tool,
     )
-    await app.state.hints.note_response(record.get("task_id"),
+    await app.state.hints.note_response(record.get("run_id"),
+                                        record.get("task_id"),
                                         record.get("sequence_id"),
                                         resp_id, tool, t_end)
     await _maybe_gap_hint(gap_hint, resp_id, tool)
@@ -702,7 +703,8 @@ async def _handle_stream(client, path, raw, body, headers, record, gap_hint=Fals
                 response_id=state["resp_id"],
                 tool_called=state["tool"],
             )
-            await app.state.hints.note_response(record.get("task_id"),
+            await app.state.hints.note_response(record.get("run_id"),
+                                                record.get("task_id"),
                                                 record.get("sequence_id"),
                                                 state["resp_id"], state["tool"],
                                                 t_end)
