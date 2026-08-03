@@ -83,6 +83,10 @@ ENGINE_METRICS: dict[str, dict[str, list[str]]] = {
                                     "vllm:kv_offload_store_bytes"],
         "offload_alloc_failures":  ["vllm:kv_offload_allocation_failure_total",
                                     "vllm:kv_offload_allocation_failure"],
+        "offload_load_time_s":  ["vllm:kv_offload_load_time_total",
+                                 "vllm:kv_offload_load_time"],
+        "offload_store_time_s": ["vllm:kv_offload_store_time_total",
+                                 "vllm:kv_offload_store_time"],
     },
     "sglang": {
         # both prefixes probed: sglang_ (v0.5.4+) and sglang: (older)
@@ -108,7 +112,8 @@ COUNTER_LOGICALS = {"eviction_events", "prompt_tokens_total", "generation_tokens
                     "_cache_hits", "_cache_queries",
                     # added counters:
                     "cached_tokens_total", "_ext_cache_hits", "_ext_cache_queries",
-                    "offload_load_bytes", "offload_store_bytes", "offload_alloc_failures"}
+                    "offload_load_bytes", "offload_store_bytes", "offload_alloc_failures",
+                    "offload_load_time_s", "offload_store_time_s"}
 
 # Histogram logicals: Prometheus exposes each as <name>_sum + <name>_count (+ _bucket).
 # We reduce to a per-window MEAN = delta(sum)/delta(count), i.e. the average value
@@ -123,7 +128,6 @@ HISTOGRAM_LOGICALS = {
     "_queue_time":        "vllm:request_queue_time_seconds",
     "_prefill_time":      "vllm:request_prefill_time_seconds",
     "_decode_time":       "vllm:request_decode_time_seconds",
-    "_offload_load_time": "vllm:kv_offload_load_time",
 }
 
 # logical -> output column name for the reduced histogram mean.
@@ -133,7 +137,6 @@ HISTOGRAM_OUT = {
     "_queue_time":        "queue_time_s_mean",
     "_prefill_time":      "prefill_time_s_mean",
     "_decode_time":       "decode_time_s_mean",
-    "_offload_load_time": "offload_load_time_s_mean",
 }
 
 # The server-side schema is FIXED, not whatever each engine happens to expose. Any
@@ -172,9 +175,14 @@ SERVER_SCHEMA = [
     "offload_load_bytes_delta",
     "offload_store_bytes",
     "offload_store_bytes_delta",
-    "offload_load_time_s_mean",
     "offload_alloc_failures",
     "offload_alloc_failures_delta",
+    "offload_load_time_s",
+    "offload_load_time_s_delta",
+    "offload_load_ms_per_byte",
+    "offload_store_time_s",
+    "offload_store_time_s_delta",
+    "offload_store_ms_per_byte",
 ]
 
 # KV-hint counters. Run-level scalars, broadcast to every row as constant columns.
@@ -324,6 +332,17 @@ def server_frame(base, engine, start, end, step):
     if {"_ext_cache_hits_delta", "_ext_cache_queries_delta"} <= set(df.columns):
         edenom = df["_ext_cache_queries_delta"].where(df["_ext_cache_queries_delta"] > 0)
         df["external_prefix_cache_hit_rate"] = df["_ext_cache_hits_delta"] / edenom
+
+    if {"offload_load_time_s_delta", "offload_load_bytes_delta"} <= set(df.columns):
+        lb = df["offload_load_bytes_delta"]
+        df["offload_load_ms_per_byte"] = (
+            1000.0 * df["offload_load_time_s_delta"] / lb.where(lb > 0)
+        )
+    if {"offload_store_time_s_delta", "offload_store_bytes_delta"} <= set(df.columns):
+        sb = df["offload_store_bytes_delta"]
+        df["offload_store_ms_per_byte"] = (
+            1000.0 * df["offload_store_time_s_delta"] / sb.where(sb > 0)
+        )
 
     df = df.rename(columns={"eviction_events_delta": "eviction_events_window"})
     df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
