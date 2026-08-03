@@ -215,13 +215,11 @@ class KVHintState:
                 return None
             return slot[0]
 
-    async def pop_task(self, run_id, task_id) -> list[str]:
-            async with self._lock:
-                keys = [k for k in self._last if k[0] == run_id and k[1] == task_id]
-                out = [self._last.pop(k) for k in keys]
-                for k in keys:
-                    self._pending.pop(k, None)
-                return out
+    async def pop_task(self, run_id: str, task_id: str) -> list[tuple[str, str]]:
+        async with self._lock:
+            keys = [k for k in self._last if k[0] == run_id and k[1] == task_id]
+            out = [(k[2], self._last.pop(k)) for k in keys]
+        return out
 
     async def snapshot(self) -> dict:
         async with self._lock:
@@ -420,17 +418,18 @@ async def hint_session_done(request: Request):
         return JSONResponse({"error": "task_id required"}, status_code=400)
     run_id = body.get("run_id")
     hints: KVHintState = app.state.hints
-    req_ids = await hints.pop_task(run_id, task_id)
-    if not req_ids:
+    pairs = await hints.pop_task(run_id, task_id)
+    if not pairs:
         hints.stats["done_no_known_requests"] += 1
         return JSONResponse({"task_id": task_id, "applied": 0,
                              "reason": "no_known_requests"})
 
-    hints.stats["done_hints_sent"] += len(req_ids)
+    hints.stats["done_hints_sent"] += len(pairs)
     results = [await _post_kv_hint(app.state.client,
-                                   {"request_id": rid, "done": True}, hints.stats)
-               for rid in req_ids]
-    return JSONResponse({"task_id": task_id, "sequences": len(req_ids),
+                                   {"request_id": rid, "done": True,
+                                    "sequence_id": seq}, hints.stats)
+               for seq, rid in pairs]
+    return JSONResponse({"task_id": task_id, "sequences": len(pairs),
                          "results": results})
 
 
