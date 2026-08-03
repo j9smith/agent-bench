@@ -95,6 +95,11 @@ _run_one(){
   export PROXY_API_KEY="$API_KEY"
   local base="http://localhost:$PROXY_PORT"
   c_grn "running $driver  concurrency=$conc tasks=$ntasks run=$run"
+  mkdir -p analysis
+  curl -s --max-time 5 "http://localhost:$VLLM_PORT/kv_hint/stats" \
+    > "analysis/hint_pre_${run}.json" 2>/dev/null || true
+  curl -s --max-time 5 "http://localhost:$PROXY_PORT/_hint/stats" \
+    > "analysis/proxy_hint_pre_${run}.json" 2>/dev/null || true
   case "$driver" in
     agentic)   "$PY" -m drivers.agentic.run_agentic --concurrency "$conc" --num-tasks "$ntasks" \
                  --model "$MODEL" --proxy-base-url "$base" --run-id "$run" \
@@ -222,6 +227,10 @@ cmd_show(){
   "$PY" ab_helpers/show_run.py "$log"
   c_dim "exporting joined table..."
   "$PY" scripts/export_metrics.py --engine auto --requests "$log" \
+    --kv-hint-url "http://localhost:$VLLM_PORT" \
+    --kv-hint-baseline "analysis/hint_pre_${run}.json" \
+    --proxy-hint-baseline "analysis/proxy_hint_pre_${run}.json" \
+    --proxy-hint-url "http://localhost:$PROXY_PORT" --out "analysis/results_$run" \
     --prometheus "http://localhost:$PROM_PORT" --step "$SCRAPE_INTERVAL" \
     --kv-hint-url "http://localhost:$VLLM_PORT" \
     --proxy-hint-url "http://localhost:$PROXY_PORT" --out "analysis/results_$run" \

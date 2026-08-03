@@ -177,6 +177,41 @@ SERVER_SCHEMA = [
     "offload_alloc_failures_delta",
 ]
 
+# KV-hint counters. Run-level scalars, broadcast to every row as constant columns.
+# Pinned for the same reason SERVER_SCHEMA is: an unhinted arm must produce the same
+# column set (all NaN) or concatenating arms breaks. Mirrors HintStats in
+# vllm/v1/core/kv_hints.py -- when a counter is added there, add it here.
+HINT_SCHEMA = [
+    "hints_received", "hints_unknown_req", "hints_no_blocks",
+    "blocks_willneed", "blocks_dontneed", "blocks_pageout", "blocks_expired",
+    "blocks_noop", "blocks_resumed", "blocks_dead_resurrected",
+    "blocks_stolen_dead", "blocks_stolen_later", "blocks_stolen_soon",
+    "apply_seconds", "reap_seconds", "record_seconds", "record_calls",
+    "hint_queue_reached",
+    "head_resident_probes", "head_absent", "head_refcnt_zero",
+    "dead_included_root", "head_protected", "resurrect_head", "resurrect_tail",
+    "shared_run_samples", "shared_run_sum", "shared_run_min", "shared_run_mean",
+    "distinct_roots", "hash_chain_entries",
+    "blocks_from_normal", "alloc_normal_after_dead",
+    "hinted_inside_shared_run",
+    "hint_lag_steps_sum", "hint_lag_max", "hint_lag_samples", "hint_lag_steps_mean",
+    "prologue_probe_samples", "prologue_run_sum", "prologue_resident_sum",
+    "prologue_referenced_sum", "prologue_first_hole_sum",
+    "prologue_run_mean", "prologue_resident_mean", "prologue_referenced_mean",
+    "prologue_first_hole_mean",
+    "remote_kv_waiters_sum", "inflight_reserved_sum", "census_samples",
+    "first_miss_probes", "first_miss_was_hinted", "first_miss_same_seq",
+    "first_miss_other_seq", "first_miss_unknown_seq",
+    "first_miss_hint_age_sum", "first_miss_hint_age_mean",
+    "record_ms_mean",
+]
+
+PROXY_HINT_SCHEMA = [
+    "tracked_sequences", "done_hints_sent", "done_no_known_requests",
+    "hint_post_ok", "hint_post_failed", "hint_post_errors", "hint_post_404",
+    "gap_hints_sent", "gap_hint_skipped_cold", "gap_discarded_stale",
+    "tools_learned",
+]
 
 class PrometheusUnreachable(Exception):
     """Prometheus isn't answering at all -- distinct from 'answered, no data'."""
@@ -475,6 +510,22 @@ def dump_raw_series(base, engine, start, end, step, out: Path) -> int:
           f"({len(df):,} samples) -> {written}")
     return len(names)
 
+def hint_delta(post: dict | None, baseline_path: Path | None) -> dict | None:
+    """post - pre, for numeric fields. Non-numeric (e.g. tools_learned) taken
+    from post as-is. Missing baseline -> post unchanged, flagged."""
+    if post is None:
+        return None
+    if not baseline_path or not baseline_path.exists():
+        return {"_baseline": "absent", **post}
+    try:
+        pre = json.loads(baseline_path.read_text())
+    except Exception:
+        return {"_baseline": "unreadable", **post}
+    out = {"_baseline": str(baseline_path)}
+    for k, v in post.items():
+        p = pre.get(k)
+        out[k] = v - p if isinstance(v, (int, float)) and isinstance(p, (int, float)) else v
+    return out
 
 def fetch_hint_stats(base: str | None, path: str, label: str) -> dict | None:
     """Read a KV-hint stats endpoint.
@@ -554,6 +605,11 @@ def main() -> int:
                     help="vLLM base url to read /kv_hint/stats from (hint builds only)")
     ap.add_argument("--proxy-hint-url", default=None,
                     help="proxy base url to read /_hint/stats from")
+    ap.add_argument("--kv-hint-baseline", type=Path, default=None,
+                    help="pre-run /kv_hint/stats snapshot; counters are cumulative "
+                         "for the life of the server process, so without this the "
+                         "numbers are a session total, not a run total")
+    ap.add_argument("--proxy-hint-baseline", type=Path, default=None)
     args = ap.parse_args()
 
     if not args.requests.exists():
@@ -602,6 +658,9 @@ def main() -> int:
     # subsequent activity contaminates them.
     hint_server = fetch_hint_stats(args.kv_hint_url, "/kv_hint/stats", "kv_hint stats")
     hint_proxy = fetch_hint_stats(args.proxy_hint_url, "/_hint/stats", "proxy hint stats")
+    hint_server_run = hint_delta(hint_server, args.kv_hint_baseline)
+    hint_proxy_run = hint_delta(hint_proxy, args.proxy_hint_baseline)
+    report_hint_stats(hint_server_run, hint_proxy_run)
     report_hint_stats(hint_server, hint_proxy)
 
     if not args.no_prometheus:
@@ -624,7 +683,7 @@ def main() -> int:
             if not args.no_raw:
                 n_raw = dump_raw_series(args.prometheus, engine, start, end, args.step,
                                         (args.out.parent if args.out else ROOT / "analysis")
-                                        / f"raw_series_{engine}")
+                                        / f"raw_series_{args.out.name if args.out else engine}")
 
             srv, resolved = server_frame(args.prometheus, engine, start, end, args.step)
             if resolved:
@@ -664,6 +723,12 @@ def main() -> int:
 
     req["engine"] = engine if engine not in ("auto", "unknown") else None
 
+    req = attach_hint_columns(req, hint_server_run, HINT_SCHEMA, "hint_")
+    req = attach_hint_columns(req, hint_proxy_run, PROXY_HINT_SCHEMA, "proxy_hint_")
+    print(f"[export] attached {len(HINT_SCHEMA)} hint + "
+          f"{len(PROXY_HINT_SCHEMA)} proxy-hint columns "
+          f"({'run-delta' if args.kv_hint_baseline else 'CUMULATIVE - no baseline'})")
+
     out = args.out or (ROOT / "analysis" / f"results_{engine}")
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -689,7 +754,13 @@ def main() -> int:
         "kv_hint_stats": hint_server,
         "proxy_hint_stats": hint_proxy,
     }
-    (out.parent / f"manifest_{engine}.json").write_text(json.dumps(manifest, indent=2))
+    (out.parent / f"manifest_{out.name}.json").write_text(json.dumps(manifest, indent=2))
+
+    if hint_server_run or hint_proxy_run:
+        (out.parent / f"hint_{out.name}.json").write_text(json.dumps(
+            {"server": hint_server_run, "proxy": hint_proxy_run,
+                "server_cumulative": hint_server, "proxy_cumulative": hint_proxy},
+            indent=2))
 
     # The per-message hash spine is an analysis input, not an output column -- it
     # would bloat the table by orders of magnitude. It's already been consumed by
@@ -703,6 +774,28 @@ def main() -> int:
     except Exception as exc:
         print(f"[export] wrote {out.with_suffix('.csv')} (parquet skipped: {exc})")
     return 0
+
+
+def attach_hint_columns(df: pd.DataFrame, stats: dict | None,
+                        schema: list[str], prefix: str) -> pd.DataFrame:
+    """Broadcast run-level hint counters across every row.
+
+    Constant per run by construction -- that's the point: it makes an arm
+    comparison a groupby rather than a manual join against a manifest.
+    Unknown keys are carried through with a warning rather than dropped, so a
+    counter added upstream shows up instead of vanishing silently.
+    """
+    stats = stats or {}
+    extra = [k for k in stats if k not in schema and not k.startswith("_")]
+    if extra:
+        print(f"[export] {prefix}: counters not in schema, carried through as "
+              f"columns: {', '.join(sorted(extra))}", file=sys.stderr)
+    for key in schema + extra:
+        v = stats.get(key, pd.NA)
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, sort_keys=True)
+        df[f"{prefix}{key}"] = v
+    return df
 
 
 if __name__ == "__main__":
