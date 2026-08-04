@@ -737,6 +737,7 @@ def run_one(inst: dict, args, logdir: Path) -> dict:
         "proxy_base": base,
         "kv_hint_done": args.kv_hint_done,
         "kv_hint_gap": args.kv_hint_gap,
+        "plas": args.plas,
         "task_text": inst["problem_statement"],
         "result_path": str(out / "result.json"),
         "timings_path": str(out / "timings.jsonl"),
@@ -890,6 +891,7 @@ def main() -> int:
          "feedback_durations": args.feedback_durations,
          "kv_hint_done": args.kv_hint_done,
          "kv_hint_gap": args.kv_hint_gap,
+         "plas": args.plas,
          "concurrency": args.concurrency, "results": results}, indent=2))
 
     def total(key):
@@ -910,6 +912,10 @@ def main() -> int:
         print(f"[openhands] timing: {timed} tool calls measured, {given} with an "
               f"estimate (compliance {rate}). rows in "
               f"logs/openhands/<task>/timings.jsonl")
+
+    if args.plas:
+        print(f"[openhands] PLAS: ON (X-PLAS -> proxy; needs vLLM "
+              f"--scheduling-policy priority)")
 
     # Failure modes that LOOK like successful runs.
     if args.delegation and total("children_spawned") == 0:
