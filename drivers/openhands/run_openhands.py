@@ -82,6 +82,9 @@ _extra_headers = {
 if cfg.get("kv_hint_gap"):
     _extra_headers["X-KV-Hint-Gap"] = "1"
 
+if cfg.get("plas"):
+    _extra_headers["X-PLAS"] = "1"
+
 llm = LLM(
     usage_id="agent",
     model=f"hosted_vllm/{cfg['model']}",
@@ -811,6 +814,9 @@ def main() -> int:
                     help="ask the proxy to send expect_return_ms before each tool "
                          "call, predicted from its own per-tool EWMA of observed "
                          "dispatch gaps. UNTESTED; run --kv-hint-done first.")
+    ap.add_argument("--plas", action="store_true",
+                help="stamp PLAS program-level attained service as request priority "
+                     "(requires vLLM --scheduling-policy priority)")
     args = ap.parse_args()
 
     try:

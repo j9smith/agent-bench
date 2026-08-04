@@ -214,6 +214,17 @@ HINT_SCHEMA = [
     "record_ms_mean",
 ]
 
+HINT_GAUGES = {
+    "transfer_rtt_static_ms", "transfer_rtt_adaptive",
+    "transfer_ewma_ms_per_byte", "shared_run_min", "hint_lag_max",
+    "distinct_roots", "hash_chain_entries",
+    # derived means from as_dict(): ratios, never differences
+    "record_ms_mean", "shared_run_mean", "hint_lag_steps_mean",
+    "prologue_first_hole_mean", "prologue_resident_mean",
+    "prologue_referenced_mean", "prologue_run_mean",
+    "first_miss_hint_age_mean",
+}
+
 PROXY_HINT_SCHEMA = [
     "tracked_sequences", "done_hints_sent", "done_no_known_requests",
     "hint_post_ok", "hint_post_failed", "hint_post_errors", "hint_post_404",

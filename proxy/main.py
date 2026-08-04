@@ -88,6 +88,24 @@ KV_HINT_CAP = int(os.environ.get("PROXY_KV_HINT_CAP", "4096"))
 KV_GAP_ALPHA = float(os.environ.get("PROXY_KV_GAP_ALPHA", "0.2"))
 KV_GAP_MIN_SAMPLES = int(os.environ.get("PROXY_KV_GAP_MIN_SAMPLES", "5"))
 
+# --- PLAS (program-level attained service). Inert unless asked for. ---
+# Autellix Eq. 1: a call's priority is the summed service of its program's prior
+# completed calls. vLLM's `priority` uses the same convention (larger = lower
+# priority), so the formula ports with no sign flip.
+PLAS_ENABLED = os.environ.get("PROXY_PLAS", "0") in ("1", "true", "True")
+# "task": one program = one trajectory (Autellix's pid). "sequence": one program
+# = one conversation. These diverge once the condenser or delegation is on, and
+# "sequence" is then wrong -- a sub-agent would look like a fresh program.
+PLAS_KEY = os.environ.get("PROXY_PLAS_KEY", "task")
+# "decode": completion_tokens only. "computed": (prompt - cached) + completion,
+# i.e. tokens actually pushed through the model. Falls back to decode when the
+# upstream omits cached_tokens.
+PLAS_SERVICE = os.environ.get("PROXY_PLAS_SERVICE", "decode")
+# 0/1 = continuous priority. >1 buckets it, the cheapest approximation of
+# Autellix's MLFQ discretisation; they discretise specifically because
+# continuous priority degenerates toward round-robin and thrashes KV.
+PLAS_QUANTUM = int(os.environ.get("PROXY_PLAS_QUANTUM", "0"))
+
 
 # Hop-by-hop headers we must not forward.
 _DROP_REQUEST_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
@@ -266,6 +284,61 @@ def _first_tool_name(payload: dict | None) -> str | None:
         pass
     return None
 
+def _call_service(usage: dict) -> int:
+    """Service consumed by one completed call, in tokens."""
+    ct = int(usage.get("completion_tokens") or 0)
+    if PLAS_SERVICE != "computed":
+        return ct
+    pt = usage.get("prompt_tokens")
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    if pt is None or cached is None:
+        return ct
+    return max(0, int(pt) - int(cached)) + ct
+
+
+class ProcessTable:
+    """PLAS process table. Single-threaded PLAS only; no ATLAS, no critical path.
+
+    The proxy is the only component that can build this. The harness knows which
+    calls belong to one program and discards that at the API boundary; the engine
+    never sees it. Same structural gap the retention hints exploit, different
+    resource.
+    """
+
+    def __init__(self) -> None:
+        self._service: dict[str, int] = defaultdict(int)
+        self._calls: dict[str, int] = defaultdict(int)
+        self._lock = asyncio.Lock()
+
+    async def service_of(self, key: str | None) -> int:
+        if not key:
+            return 0
+        async with self._lock:
+            return self._service[key]
+
+    async def complete(self, key: str | None, service: int) -> None:
+        if not key:
+            return
+        async with self._lock:
+            self._service[key] += max(0, int(service))
+            self._calls[key] += 1
+
+    async def reset(self) -> None:
+        async with self._lock:
+            self._service.clear()
+            self._calls.clear()
+
+    async def snapshot(self) -> dict:
+        async with self._lock:
+            v = sorted(self._service.values())
+            n = len(v)
+            q = lambda f: v[min(n - 1, int(f * n))] if n else 0
+            return {"programs": n, "calls": sum(self._calls.values()),
+                    "key": PLAS_KEY, "service_metric": PLAS_SERVICE,
+                    "quantum": PLAS_QUANTUM,
+                    "service_p10": q(0.10), "service_p50": q(0.50),
+                    "service_p90": q(0.90),
+                    "spread_p90_p10": round(q(0.90) / max(q(0.10), 1), 2)}
 
 class TurnCounter:
     def __init__(self) -> None:
@@ -288,6 +361,7 @@ async def lifespan(app: FastAPI):
     app.state.log = RunRouter(LOG_DIR)
     app.state.turns = TurnCounter()
     app.state.hints = KVHintState(KV_HINT_CAP)
+    app.state.plas = ProcessTable()
     print(f"[proxy] upstream={UPSTREAM_BASE_URL} log_dir={LOG_DIR} inject_usage={INJECT_USAGE}")
     yield
     await app.state.client.aclose()
@@ -432,6 +506,17 @@ async def hint_session_done(request: Request):
     return JSONResponse({"task_id": task_id, "sequences": len(pairs),
                          "results": results})
 
+@app.post("/_plas/reset")
+async def plas_reset():
+    """Clear attained service. Call between sweep points, same as
+    /reset_prefix_cache -- otherwise point N inherits point N-1's priorities."""
+    await app.state.plas.reset()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/_plas/stats")
+async def plas_stats():
+    return JSONResponse(await app.state.plas.snapshot())
 
 @app.get("/_hint/stats")
 async def hint_stats():
@@ -539,6 +624,29 @@ async def proxy(path: str, request: Request):
     await app.state.hints.observe_gap(run_id, task_id, sequence_id, time.time())
     gap_hint = request.headers.get("X-KV-Hint-Gap") in ("1", "true", "True")
 
+    # --- PLAS: read the program's attained service, stamp it on the call. ---
+    # Accumulation happens unconditionally (see _handle_*); only the WRITE is
+    # gated, so an FCFS arm still leaves a warm table and the two arms differ
+    # in exactly one thing: whether the field is on the wire.
+    plas_key = task_id if PLAS_KEY == "task" else sequence_id
+    plas_cum = await app.state.plas.service_of(plas_key)
+    record["plas_key"] = plas_key
+    record["plas_service_cum"] = plas_cum
+    record["plas_priority"] = None
+
+    _hdr_plas = request.headers.get("X-PLAS")
+    plas_on = (_hdr_plas in ("1", "true", "True")) if _hdr_plas is not None else PLAS_ENABLED
+
+    if plas_on and plas_key:
+        p = int(plas_cum // PLAS_QUANTUM) if PLAS_QUANTUM > 1 else int(plas_cum)
+        body["priority"] = p
+        record["plas_priority"] = p
+        raw = json.dumps(body).encode("utf-8")
+    elif "priority" in body:
+        # Never let a client-supplied priority through in an FCFS arm.
+        body.pop("priority")
+        raw = json.dumps(body).encode("utf-8")
+
     if record["stream"]:
         return await _handle_stream(client, path, raw, body, fwd_headers, record,
                                     gap_hint)
@@ -599,6 +707,7 @@ async def _handle_unary(client, path, raw, headers, record, gap_hint=False):
                                         record.get("sequence_id"),
                                         resp_id, tool, t_end)
     await _maybe_gap_hint(gap_hint, resp_id, tool)
+    await app.state.plas.complete(record.get("plas_key"), _call_service(usage))
     await app.state.log.write(record)
     return _plain_response(upstream)
 
@@ -708,6 +817,8 @@ async def _handle_stream(client, path, raw, body, headers, record, gap_hint=Fals
                                                 state["resp_id"], state["tool"],
                                                 t_end)
             await _maybe_gap_hint(gap_hint, state["resp_id"], state["tool"])
+            await app.state.plas.complete(record.get("plas_key"),
+                                                      _call_service(usage))
             await log.write(record)
 
     return StreamingResponse(
